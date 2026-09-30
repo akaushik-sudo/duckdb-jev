@@ -1,0 +1,38 @@
+# name: test/sql/jev_host_refused.test
+# description: an SNX_JEV_API_URL that is not TypeSafe or loopback is refused before any request
+# group: [sql]
+
+#
+# scripts/run_tests_with_mock.sh runs this once per hostile URL, with a valid key. Some of those
+# URLs would reach the running mock if the check let them through (userinfo and similar tricks),
+# so a pass means the request was never sent, not merely that it failed.
+
+require snx_jev
+
+require json
+
+require-env JEV_ASSERT_HOST_REFUSED
+
+require-env SNX_JEV_API_URL
+
+statement error
+SELECT jev({'name': 'Ada'}, 'the name is European');
+----
+refusing SNX_JEV_API_URL
+
+# ...without repeating the refused value: it reaches every caller, and can carry credentials
+statement error
+SELECT jev({'name': 'Ada'}, 'the name is European');
+----
+<!REGEX>:.*(snxleak|evil|nip\.io|user:|99999|65536|%2e|ftp:).*
+
+# The refusal is fixed for the process: no setting brings the request back
+statement error
+SET jev_api_url = 'http://127.0.0.1:1/v1/systemone';
+----
+unrecognized configuration parameter
+
+query I
+SELECT jev_stats()->>'requests';
+----
+0

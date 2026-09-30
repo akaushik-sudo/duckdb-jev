@@ -101,8 +101,12 @@ struct JevBatch {
 
 //! Keyed by content, not by row id: an UPDATE changes the payload and the row is
 //! judged again, while two identical rows are judged once.
-static string CacheEntryKey(const string &question_key, const string &row_json) {
-	return to_string(Hash(question_key.c_str(), question_key.size())) + ":" +
+//!
+//! The scope (the connection's customer, see JevConfig::cache_scope) comes first and
+//! verbatim, so one customer's answers are never a cache hit for another's: a hit would
+//! show, through its speed or through jev_stats(), that someone else sent the same text.
+static string CacheEntryKey(const string &scope, const string &question_key, const string &row_json) {
+	return scope + "\x1f" + to_string(Hash(question_key.c_str(), question_key.size())) + ":" +
 	       to_string(Hash(row_json.c_str(), row_json.size())) + ":" + to_string(row_json.size());
 }
 
@@ -167,13 +171,13 @@ static void CheckSpendGuards(const JevBindData &data, idx_t rows, idx_t chars) {
 	auto total_chars = data.chars_sent->fetch_add(chars) + chars;
 	if (data.config.max_rows_per_statement > 0 && total_rows > data.config.max_rows_per_statement) {
 		throw InvalidInputException("jev: this statement would send %llu rows to the API, above "
-		                            "jev_max_rows_per_statement = %llu",
+		                            "snx_jev_max_rows_per_statement = %llu",
 		                            static_cast<uint64_t>(total_rows),
 		                            static_cast<uint64_t>(data.config.max_rows_per_statement));
 	}
 	if (data.config.max_chars_per_statement > 0 && total_chars > data.config.max_chars_per_statement) {
 		throw InvalidInputException("jev: this statement would send %llu characters of row data to the API, above "
-		                            "jev_max_chars_per_statement = %llu",
+		                            "snx_jev_max_chars_per_statement = %llu",
 		                            static_cast<uint64_t>(total_chars),
 		                            static_cast<uint64_t>(data.config.max_chars_per_statement));
 	}
@@ -340,7 +344,7 @@ static void JevExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 
 		auto row_json = JevValueToJSON(row_value);
 		auto question_key = question.CacheKey();
-		auto entry_key = CacheEntryKey(question_key, row_json);
+		auto entry_key = CacheEntryKey(data.config.cache_scope, question_key, row_json);
 
 		string cached;
 		if (session.Lookup(entry_key, cached)) {
@@ -389,8 +393,8 @@ static void JevExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 	}
 
 	if (!batches.empty()) {
-		// Fail before opening a connection when the key or the budget is missing.
-		data.config.RequireAPIKey();
+		// Fail before opening a connection when the endpoint, the key or the budget is missing.
+		data.config.RequireSendable();
 		CheckSpendGuards(data, pending_rows, pending_chars);
 		auto error = RunBatches(data, batches);
 

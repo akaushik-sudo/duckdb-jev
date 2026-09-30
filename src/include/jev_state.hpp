@@ -30,7 +30,7 @@ struct JevStats {
 //!
 //! DuckDB already runs the scan on several threads, so a semaphore per query would not
 //! bound anything: the ceiling has to be shared. Every request in the process goes
-//! through this pool, which is what makes jev_concurrency mean what it says.
+//! through this pool, which is what makes snx_jev_concurrency mean what it says.
 class JevThreadPool {
 public:
 	explicit JevThreadPool(idx_t worker_count);
@@ -65,7 +65,7 @@ public:
 	void Clear();
 	idx_t CachedAnswers();
 
-	//! The shared pool, rebuilt when jev_concurrency changes. Callers keep the
+	//! The shared pool, rebuilt when snx_jev_concurrency changes. Callers keep the
 	//! shared_ptr for as long as they have tasks in flight, so a resize never pulls
 	//! the pool out from under a running query.
 	shared_ptr<JevThreadPool> Pool(idx_t workers);
