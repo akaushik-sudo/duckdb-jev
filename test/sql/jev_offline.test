@@ -7,7 +7,7 @@ SELECT jev_version();
 ----
 Catalog Error
 
-require jev
+require snx_jev
 
 # jev_stats() hands back JSON, which the assertions below read
 require json

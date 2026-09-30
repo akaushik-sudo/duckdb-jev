@@ -1,9 +1,17 @@
-<h1 align="center">jev for DuckDB</h1>
+<h1 align="center">snx_jev for DuckDB</h1>
 
 <p align="center">Ask your DuckDB tables questions in plain language.</p>
 
+> **Sentrinox fork.** `snx_jev` is a private fork of
+> [judoaseeta/duckdb-jev](https://github.com/judoaseeta/duckdb-jev) (MIT, forked at 0.1.0,
+> `58e5484`). It is renamed so it can never be mistaken for, or collide with, the community `jev`
+> extension, and it is pinned to the DuckDB version the analytics services run (v1.5.4). It is being
+> narrowed to one hardened function, `snx_prompt_intent`, for classifying `ai_txn` prompts. Until
+> that lands, everything below describes the upstream functions, unchanged apart from the extension name.
+> `upstream` in a clone is judoaseeta's repo; nothing is pushed there.
+
 ```sql
-LOAD jev;
+LOAD snx_jev;
 SET jev_api_key = '...';
 
 SELECT * FROM people WHERE jev(people, 'the name is European');
@@ -55,21 +63,22 @@ depends on its size.
 
 ## Install
 
-The extension is not in the community repository yet, so build it from source. You need CMake, a C++17
-compiler, OpenSSL and the DuckDB version this repo pins (`duckdb/` submodule, currently v1.5.5).
+Build it from source. You need CMake, a C++17 compiler, OpenSSL and the DuckDB version this repo
+pins (`duckdb/` submodule, currently v1.5.4 — it must match the DuckDB that loads the extension).
 
 ```bash
-git clone --recurse-submodules https://github.com/judoaseeta/duckdb_jev.git
-cd duckdb_jev
+git clone --recurse-submodules https://github.com/akaushik-sudo/duckdb-jev.git
+cd duckdb-jev
 make release                       # on macOS: OPENSSL_ROOT_DIR=$(brew --prefix openssl@3) make release
-./build/release/duckdb             # a shell with jev already loaded
+./build/release/duckdb             # a shell with snx_jev already loaded
+make test_mock                     # the regression suite against test/mock_api.py
 ```
 
 To load the built extension into another DuckDB of the same version:
 
 ```sql
 -- duckdb -unsigned
-LOAD '/path/to/duckdb_jev/build/release/extension/jev/jev.duckdb_extension';
+LOAD '/path/to/duckdb-jev/build/release/extension/snx_jev/snx_jev.duckdb_extension';
 ```
 
 ### API key

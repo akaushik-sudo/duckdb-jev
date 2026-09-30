@@ -2,7 +2,7 @@
 # description: the judgment functions against the deterministic mock (test/mock_api.py)
 # group: [sql]
 
-require jev
+require snx_jev
 
 require json
 

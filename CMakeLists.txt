@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.5)
 
-set(TARGET_NAME jev)
+set(TARGET_NAME snx_jev)
 
 find_package(OpenSSL REQUIRED)
 
@@ -18,7 +18,7 @@ include_directories(
   third_party/json)
 
 set(EXTENSION_SOURCES
-  src/jev_extension.cpp
+  src/snx_jev_extension.cpp
   src/jev_functions.cpp
   src/jev_client.cpp
   src/jev_config.cpp
