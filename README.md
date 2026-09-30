@@ -69,8 +69,9 @@ a query moves between the two by changing `jev.batch_size` into `snx_jev_batch_s
    (2000) characters first, so no batch outgrows the context window.
 4. `snx_jev_concurrency` (16) requests are in flight at once, over connections that are kept alive. The
    ceiling is process-wide, so it still holds when DuckDB runs the scan on several threads. A
-   process-wide token bucket, `snx_jev_max_requests_per_minute` (1000, below Jev's 1,200), paces them,
-   so a large query slows down instead of meeting 429s.
+   process-wide token bucket, `SNX_JEV_MAX_REQUESTS_PER_MINUTE` in the environment at LOAD (1000, below
+   Jev's 1,200; `0` = none), paces them, so a large query slows down instead of meeting 429s. It is not
+   a setting: the bucket is shared, and one connection must not be able to raise it for all.
    Two queries (or two scan threads) that meet the same uncached row at once send it once: one sends,
    the other waits for that answer.
 5. Answers are cached by row content for as long as the process lives, so re-running a query, changing
@@ -231,7 +232,6 @@ silently different question. The answers come back in the order the questions we
 | `snx_jev_threshold` | `0.5` | Probability at which `jev()` returns true |
 | `snx_jev_batch_size` | `25` | Rows per request. Accuracy drops measurably above ~20-25 |
 | `snx_jev_concurrency` | `16` | Requests in flight at once, process-wide |
-| `snx_jev_max_requests_per_minute` | `1000` | Process-wide pace (token bucket, burst of 1/20 of it); `0` = none |
 | `snx_jev_timeout` | `30` | Seconds a single request may take |
 | `snx_jev_max_retries` | `6` | Attempts for a retryable failure (429, 5xx, a dropped connection) |
 | `snx_jev_max_rows_per_statement` | `0` (off) | Refuse a statement that would send more rows than this |

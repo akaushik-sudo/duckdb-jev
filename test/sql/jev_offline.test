@@ -61,6 +61,11 @@ SELECT current_setting('jev_api_key');
 ----
 unrecognized configuration parameter
 
+statement error
+SET snx_jev_max_requests_per_minute = 0;
+----
+unrecognized configuration parameter
+
 query I
 SELECT count(*) FROM duckdb_settings()
 WHERE name ILIKE '%jev%' AND (name ILIKE '%key%' OR name ILIKE '%url%' OR name ILIKE '%host%');

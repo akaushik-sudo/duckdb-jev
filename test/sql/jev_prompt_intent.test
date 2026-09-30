@@ -207,29 +207,42 @@ statement ok
 RESET snx_jev_max_rows_per_statement;
 
 #
-# The rate limiter paces requests process-wide
+# The rate is process-wide, from SNX_JEV_MAX_REQUESTS_PER_MINUTE: no connection can change it
+#
+
+statement error
+SET snx_jev_max_requests_per_minute = 0;
+----
+unrecognized configuration parameter
+
+#
+# The model is part of the cache key: another model's answers are not reused
 #
 
 statement ok
-SET VARIABLE scope_customer_id = 505;
+SET VARIABLE scope_customer_id = 606;
 
 statement ok
-SET snx_jev_max_requests_per_minute = 60;
+SELECT snx_prompt_intent(user_prompt) FROM prompts WHERE id <= 3;
 
 statement ok
-SET snx_jev_batch_size = 1;
+SET snx_jev_model = 'jev-other';
 
-# 60 a minute is a bucket of 3 refilled at 1 a second: 6 requests cannot all go at once
 statement ok
-SELECT snx_prompt_intent(user_prompt) FROM prompts WHERE id <= 6;
+SELECT snx_prompt_intent(user_prompt) FROM prompts WHERE id <= 3;
 
 query II
-SELECT snx_jev_last_query_stats()->>'requests', (snx_jev_last_query_stats()->>'rate_limited_ms')::BIGINT >= 1000;
+SELECT snx_jev_last_query_stats()->>'rows_sent', snx_jev_last_query_stats()->>'cache_hits';
 ----
-6	true
+3	0
 
 statement ok
-RESET snx_jev_batch_size;
+RESET snx_jev_model;
 
 statement ok
-RESET snx_jev_max_requests_per_minute;
+SELECT snx_prompt_intent(user_prompt) FROM prompts WHERE id <= 3;
+
+query I
+SELECT snx_jev_last_query_stats()->>'cache_hits';
+----
+3

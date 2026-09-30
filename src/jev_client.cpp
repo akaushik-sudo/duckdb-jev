@@ -212,13 +212,24 @@ JevRequestSize JevMeasureRequest(const JevConfig &config, const JevQuestionSet &
 	// follow the layout if it changes. A placeholder row "0" stands in for the row JSON;
 	// the index digits of a large batch add a few bytes more, which the token estimate's
 	// margin covers.
-	auto empty = BuildRequestBody(config, set, {}).size();
-	auto one = BuildRequestBody(config, set, {"0"}).size();
-	return JevRequestSize {empty, one - empty - 1};
+	auto empty = JevEstimateTokens(BuildRequestBody(config, set, {}));
+	auto one = JevEstimateTokens(BuildRequestBody(config, set, {"0"}));
+	return JevRequestSize {empty, one > empty ? one - empty : 0};
 }
 
-idx_t JevEstimateTokens(idx_t bytes) {
-	return (bytes + 2) / 3;
+idx_t JevEstimateTokens(const string &text) {
+	idx_t ascii_bytes = 0;
+	idx_t other_chars = 0;
+	for (auto c : text) {
+		auto byte = static_cast<unsigned char>(c);
+		if (byte < 0x80) {
+			ascii_bytes++;
+		} else if ((byte & 0xC0) != 0x80) {
+			// the first byte of a multi-byte character
+			other_chars++;
+		}
+	}
+	return (ascii_bytes + 2) / 3 + other_chars * 2;
 }
 
 static bool IsRetryable(int status) {
@@ -274,7 +285,7 @@ JevCallResult JevCallAPI(const JevConfig &config, const JevQuestionSet &set, con
 	for (idx_t attempt = 0; attempt < config.max_retries; attempt++) {
 		// Paced before every attempt, retries included, so parallel requests stay under Jev's
 		// limit instead of meeting it as 429s.
-		rate_limited_ms += session.AcquireRequestPermit(config.max_requests_per_minute);
+		rate_limited_ms += session.AcquireRequestPermit(environment.max_requests_per_minute);
 		auto &client = GetClient(origin, config);
 		auto started = std::chrono::steady_clock::now();
 		auto response = client.Post(path, headers, body, "application/json");

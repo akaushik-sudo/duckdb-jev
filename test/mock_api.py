@@ -21,7 +21,8 @@ The rules are fixed so the expected results in test/sql/*.test never move:
 
   A rubric text containing "trigger422" answers 422 (a non-retryable error).
   A rubric text containing "trigger503" answers 503 (retryable, so it exhausts the retries).
-  A row containing "slowmock" makes the response wait 1.5 s, so concurrent queries overlap.
+  A row containing "slowmock" makes the response wait 3 s, so concurrent queries overlap.
+  A row containing "fail422" makes it wait 3 s and then answer 422, failing the whole batch.
   usage.input_tokens = len(request body) // 4
 
 Every answer also carries fields a real answer does not, so the tests can see what was sent:
@@ -122,8 +123,12 @@ class Handler(BaseHTTPRequestHandler):
             if "trigger503" in texts:
                 return self._send(503, {"error": "mock overloaded"})
 
-            if "slowmock" in json.dumps(items):
-                time.sleep(1.5)
+            payload = json.dumps(items)
+            if "fail422" in payload:
+                time.sleep(3)
+                return self._send(422, {"error": "mock: a row in this batch is rejected"})
+            if "slowmock" in payload:
+                time.sleep(3)
 
             expected = {"item_%s_%s" % (n, q) for n in items for q in rubric}
             if set(questions) != expected:
