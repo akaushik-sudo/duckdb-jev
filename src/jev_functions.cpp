@@ -11,13 +11,24 @@
 #include "json.hpp"
 
 #include <unordered_map>
+#include <unordered_set>
 
 namespace duckdb {
 
 using nlohmann::ordered_json;
 
 //! Which field of the answer the caller wants.
-enum class JevResult : uint8_t { PREDICATE, PROBABILITY, SCORE, SCORE_NORM, CHOICE, CONFIDENCE, EVAL, ASK };
+enum class JevResult : uint8_t {
+	PREDICATE,
+	PROBABILITY,
+	SCORE,
+	SCORE_NORM,
+	CHOICE,
+	CONFIDENCE,
+	EVAL,
+	ASK,
+	PROMPT_INTENT
+};
 //! Where the question kind comes from: the function itself, or one of its arguments.
 enum class JevKindSource : uint8_t { NOUL, SCORE, CHOICE, FROM_ARGUMENT };
 
@@ -263,6 +274,7 @@ static void ParseQuestionSet(const string &text, JevQuestionSet &set, vector<str
 			throw InvalidInputException("jev_ask: question '%s' must be an object.", name);
 		}
 		JevQuestion question;
+		question.name = name;
 		question.kind = RequireText(spec, "type", name);
 		question.query = RequireText(spec, "question", name);
 
@@ -374,7 +386,7 @@ static void CheckSpendGuards(const JevBindData &data, idx_t rows, idx_t chars) {
 //! failure is handed back rather than thrown, so the caller can still keep the answers
 //! the other batches already paid for; it waits for all of them either way, because the
 //! workers write into the groups.
-static std::exception_ptr RunBatches(const JevBindData &data, vector<JevBatch> &batches) {
+static std::exception_ptr RunBatches(const JevBindData &data, vector<JevBatch> &batches, JevQueryState &query) {
 	auto &state = JevState::Get();
 	auto pool = state.Pool(data.config.concurrency);
 
@@ -383,15 +395,20 @@ static std::exception_ptr RunBatches(const JevBindData &data, vector<JevBatch> &
 	for (auto &batch : batches) {
 		auto *batch_ptr = &batch;
 		auto *config = &data.config;
-		futures.push_back(pool->Submit([batch_ptr, config, &state]() {
+		futures.push_back(pool->Submit([batch_ptr, config, &state, &query]() {
 			auto &group = *batch_ptr->group;
 			vector<string> rows(group.rows.begin() + batch_ptr->start,
 			                    group.rows.begin() + batch_ptr->start + batch_ptr->count);
 			state.stats.in_flight++;
 			try {
-				auto answers = JevCallAPI(*config, group.set, rows);
-				for (idx_t i = 0; i < answers.size(); i++) {
-					group.answers[batch_ptr->start + i] = std::move(answers[i]);
+				auto call = JevCallAPI(*config, group.set, rows);
+				query.current.requests++;
+				query.current.input_tokens += call.input_tokens;
+				query.current.output_tokens += call.output_tokens;
+				query.current.retries += call.retries;
+				query.current.rate_limited_ms += call.rate_limited_ms;
+				for (idx_t i = 0; i < call.answers.size(); i++) {
+					group.answers[batch_ptr->start + i] = std::move(call.answers[i]);
 				}
 			} catch (...) {
 				state.stats.in_flight--;
@@ -531,11 +548,149 @@ static void WriteAnswer(const JevBindData &data, Vector &result, idx_t row, cons
 	}
 }
 
+//===--------------------------------------------------------------------===//
+// snx_prompt_intent: the taxonomy
+//===--------------------------------------------------------------------===//
+
+//! The questions snx_prompt_intent asks, compiled in: SQL cannot change what is asked.
+//! Labels, descriptions and wording are analytics-schema's prompt intent spec §1 (taxonomy
+//! version 1). Changing any of them changes the cache key, so old answers are not mixed
+//! with new ones.
+//!
+//! The wording, including the per-item pointers, is Phase 1's compact layout, the one
+//! measured against the live API (spec §11).
+static const JevQuestionSet &PromptIntentQuestions() {
+	static const JevQuestionSet set = []() {
+		JevQuestionSet questions;
+		JevQuestion intent;
+		intent.name = "intent";
+		intent.kind = "choice";
+		intent.query = "What is the primary intent of this user prompt sent to an AI assistant?";
+		intent.options = {"work_related", "personal", "other"};
+		intent.descriptions = {
+		    "Asks for help with a job task: code, data, documents, analysis, business communication",
+		    "Personal life, hobbies, health, relationships, shopping, entertainment \xE2\x80\x94 not a job task",
+		    "Too short, empty, or ambiguous to place in either label above"};
+		questions.questions.push_back(std::move(intent));
+
+		JevQuestion malicious;
+		malicious.name = "malicious";
+		// Phase 1's compact wording, which kept every malicious prompt at >= 0.92 while
+		// every other stayed <= 0.2 (spec §11). A generic "is it true of" pointer lost that margin.
+		malicious.pointer = "Using {rubric} in the state: is {item} malicious?";
+		malicious.kind = "noul";
+		malicious.query = "Does this user prompt try to misuse, attack, or cause harm through an AI assistant?";
+		malicious.descriptions = {"Tries to cause harm or misuse the assistant: jailbreaks, prompt injection, "
+		                          "malware, fraud, harassment, extracting secrets or credentials",
+		                          "An ordinary request, whatever its topic"};
+		questions.questions.push_back(std::move(malicious));
+		return questions;
+	}();
+	return set;
+}
+
+static LogicalType PromptIntentType() {
+	child_list_t<LogicalType> fields;
+	fields.push_back(make_pair("intent", LogicalType::VARCHAR));
+	fields.push_back(make_pair("intent_confidence", LogicalType::DOUBLE));
+	fields.push_back(make_pair("intent_probabilities", LogicalType::MAP(LogicalType::VARCHAR, LogicalType::DOUBLE)));
+	fields.push_back(make_pair("malicious_probability", LogicalType::DOUBLE));
+	return LogicalType::STRUCT(std::move(fields));
+}
+
+//! One row's answers as the snx_prompt_intent struct. A field the answer lacks is NULL,
+//! never a default: 'other' and 0 are real answers.
+static Value PromptIntentValue(const vector<string> &answers) {
+	auto parse = [](const string &json) {
+		try {
+			return ordered_json::parse(json);
+		} catch (std::exception &error) {
+			throw IOException("snx_prompt_intent: could not parse an answer: %s", error.what());
+		}
+	};
+	auto intent = parse(answers[0]);
+	auto malicious = parse(answers[1]);
+
+	auto text = [](const ordered_json &answer, const char *field) {
+		auto entry = answer.find(field);
+		return entry != answer.end() && entry->is_string() ? Value(entry->get<string>()) : Value(LogicalType::VARCHAR);
+	};
+	auto number = [](const ordered_json &answer, const char *field) {
+		auto entry = answer.find(field);
+		return entry != answer.end() && entry->is_number() ? Value::DOUBLE(entry->get<double>())
+		                                                   : Value(LogicalType::DOUBLE);
+	};
+
+	auto map_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::DOUBLE);
+	Value probabilities(map_type);
+	auto entry = intent.find("probabilities");
+	if (entry != intent.end() && entry->is_object()) {
+		vector<Value> keys;
+		vector<Value> values;
+		for (auto &item : entry->items()) {
+			if (item.value().is_number()) {
+				keys.emplace_back(item.key());
+				values.push_back(Value::DOUBLE(item.value().get<double>()));
+			}
+		}
+		probabilities = Value::MAP(LogicalType::VARCHAR, LogicalType::DOUBLE, std::move(keys), std::move(values));
+	}
+
+	child_list_t<Value> fields;
+	fields.push_back(make_pair("intent", text(intent, "choice")));
+	fields.push_back(make_pair("intent_confidence", number(intent, "confidence")));
+	fields.push_back(make_pair("intent_probabilities", std::move(probabilities)));
+	fields.push_back(make_pair("malicious_probability", number(malicious, "noul")));
+	return Value::STRUCT(std::move(fields));
+}
+
+//===--------------------------------------------------------------------===//
+// Execute
+//===--------------------------------------------------------------------===//
+
+//! Claims this statement made in the single-flight registry. Every claim is completed
+//! exactly once - with the answer, or empty when it could not be sent - even when the
+//! statement throws, so no other query waits on it forever.
+class JevClaims {
+public:
+	JevClaims(JevState &session_p, idx_t max_entries_p) : session(session_p), max_entries(max_entries_p) {
+	}
+	~JevClaims() {
+		for (auto &key : open) {
+			session.Complete(key, string(), max_entries);
+		}
+	}
+	void Add(const string &key) {
+		open.insert(key);
+	}
+	void Complete(const string &key, const string &answer) {
+		if (open.erase(key) > 0) {
+			session.Complete(key, answer, max_entries);
+		}
+	}
+
+private:
+	JevState &session;
+	idx_t max_entries;
+	std::unordered_set<string> open;
+};
+
+//! Rows whose key another query was already sending: they take that query's answer.
+struct JevWait {
+	std::shared_future<string> answer;
+	vector<idx_t> targets;
+};
+
 static void JevExecute(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	auto &data = func_expr.bind_info->Cast<JevBindData>();
 	auto &session = JevState::Get();
+	auto &context = state.GetContext();
+	auto query = JevQueryState::Get(context);
+	// Read now, not at bind: see JevConfig::CacheScope.
+	auto scope = JevConfig::CacheScope(context);
 	auto count = args.size();
+	bool prompt_intent = data.result == JevResult::PROMPT_INTENT;
 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &validity = FlatVector::Validity(result);
@@ -548,14 +703,25 @@ static void JevExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 	std::unordered_map<string, unique_ptr<JevGroup>> groups;
 	// jev_ask: each distinct questions text is parsed once per chunk
 	std::unordered_map<string, JevGroup *> parsed_sets;
+	JevClaims claims(session, data.config.cache_max_entries);
+	vector<JevWait> waits;
+	std::unordered_map<string, idx_t> wait_index;
 
-	// Pass 1: serialise every row, answer what the cache already knows and group the rest.
+	// Pass 1: serialise every row, answer what the cache already knows, wait on what another
+	// query is already sending, and group the rest.
 	for (idx_t i = 0; i < count; i++) {
 		auto row_value = args.data[0].GetValue(i);
-		auto query_value = args.data[1].GetValue(i);
-		if (row_value.IsNull() || query_value.IsNull()) {
+		if (row_value.IsNull()) {
 			validity.SetInvalid(i);
 			continue;
+		}
+		Value query_value;
+		if (!prompt_intent) {
+			query_value = args.data[1].GetValue(i);
+			if (query_value.IsNull()) {
+				validity.SetInvalid(i);
+				continue;
+			}
 		}
 		if (data.threshold_arg != NO_ARG) {
 			auto threshold_value = args.data[data.threshold_arg].GetValue(i);
@@ -565,7 +731,20 @@ static void JevExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 		}
 
 		JevGroup *group = nullptr;
-		if (data.result == JevResult::ASK) {
+		auto find_or_add = [&](JevQuestionSet set, vector<string> names) {
+			auto set_key = set.CacheKey();
+			auto entry = groups.find(set_key);
+			if (entry == groups.end()) {
+				auto fresh = make_uniq<JevGroup>();
+				fresh->set = std::move(set);
+				fresh->names = std::move(names);
+				entry = groups.insert(make_pair(set_key, std::move(fresh))).first;
+			}
+			return entry->second.get();
+		};
+		if (prompt_intent) {
+			group = find_or_add(PromptIntentQuestions(), {});
+		} else if (data.result == JevResult::ASK) {
 			auto text = query_value.ToString();
 			auto known = parsed_sets.find(text);
 			if (known != parsed_sets.end()) {
@@ -574,15 +753,7 @@ static void JevExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 				JevQuestionSet set;
 				vector<string> names;
 				ParseQuestionSet(text, set, names);
-				auto set_key = set.CacheKey();
-				auto entry = groups.find(set_key);
-				if (entry == groups.end()) {
-					auto fresh = make_uniq<JevGroup>();
-					fresh->set = std::move(set);
-					fresh->names = std::move(names);
-					entry = groups.insert(make_pair(set_key, std::move(fresh))).first;
-				}
-				group = entry->second.get();
+				group = find_or_add(std::move(set), std::move(names));
 				parsed_sets.insert(make_pair(text, group));
 			}
 		} else {
@@ -595,43 +766,53 @@ static void JevExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 			level_counts[i] = MaxValue<idx_t>(question.options.size(), 1);
 			JevQuestionSet set;
 			set.questions.push_back(std::move(question));
-			auto set_key = set.CacheKey();
-			auto entry = groups.find(set_key);
-			if (entry == groups.end()) {
-				auto fresh = make_uniq<JevGroup>();
-				fresh->set = std::move(set);
-				entry = groups.insert(make_pair(set_key, std::move(fresh))).first;
-			}
-			group = entry->second.get();
+			group = find_or_add(std::move(set), {});
 		}
 		row_groups[i] = group;
+		query->used = true;
 
 		auto row_json = JevValueToJSON(row_value, data.config.max_value_chars);
-		auto entry_key = CacheEntryKey(data.config.cache_scope, group->set.CacheKey(), row_json);
+		auto entry_key = CacheEntryKey(scope, group->set.CacheKey(), row_json);
 
-		string cached;
-		if (session.Lookup(entry_key, cached)) {
-			session.stats.cache_hits++;
-			answers[i] = DecodeAnswers(cached);
-			resolved[i] = true;
+		// The same payload earlier in this chunk: share its slot or its wait.
+		auto known = group->row_index.find(row_json);
+		if (known != group->row_index.end()) {
+			group->targets[known->second].push_back(i);
+			continue;
+		}
+		auto waiting = wait_index.find(entry_key);
+		if (waiting != wait_index.end()) {
+			waits[waiting->second].targets.push_back(i);
 			continue;
 		}
 
-		auto known = group->row_index.find(row_json);
-		idx_t row_slot;
-		if (known == group->row_index.end()) {
-			row_slot = group->rows.size();
-			group->row_index.insert(make_pair(row_json, row_slot));
-			group->cache_keys.push_back(entry_key);
-			group->rows.push_back(std::move(row_json));
-			group->targets.emplace_back();
-		} else {
-			row_slot = known->second;
+		string cached;
+		std::shared_future<string> in_flight;
+		switch (session.LookupOrClaim(entry_key, cached, in_flight)) {
+		case JevClaim::HIT:
+			session.stats.cache_hits++;
+			query->current.cache_hits++;
+			answers[i] = DecodeAnswers(cached);
+			resolved[i] = true;
+			continue;
+		case JevClaim::WAIT:
+			wait_index.insert(make_pair(entry_key, waits.size()));
+			waits.push_back(JevWait {std::move(in_flight), {i}});
+			continue;
+		case JevClaim::CLAIMED:
+			claims.Add(entry_key);
+			break;
 		}
+
+		auto row_slot = group->rows.size();
+		group->row_index.insert(make_pair(row_json, row_slot));
+		group->cache_keys.push_back(entry_key);
+		group->rows.push_back(std::move(row_json));
+		group->targets.emplace_back();
 		group->targets[row_slot].push_back(i);
 	}
 
-	// Pass 2: everything the cache could not answer goes out in batches.
+	// Pass 2: everything this statement claimed goes out in batches.
 	vector<JevBatch> batches;
 	idx_t pending_rows = 0;
 	idx_t pending_chars = 0;
@@ -647,18 +828,19 @@ static void JevExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 
 	if (!batches.empty()) {
 		// Fail before opening a connection when the endpoint, the key or the budget is missing.
+		// Throwing here completes every claim empty (JevClaims), so waiters fail rather than hang.
 		data.config.RequireSendable();
 		CheckSpendGuards(data, pending_rows, pending_chars);
-		auto error = RunBatches(data, batches);
+		query->current.rows_sent += pending_rows;
+		auto error = RunBatches(data, batches, *query);
 
 		for (auto &entry : groups) {
 			auto &group = *entry.second;
 			for (idx_t slot = 0; slot < group.rows.size(); slot++) {
 				if (group.answers[slot].empty()) {
-					continue; // its batch failed
+					continue; // its batch failed; the claim is completed empty below
 				}
-				session.Store(group.cache_keys[slot], EncodeAnswers(group.answers[slot]),
-				              data.config.cache_max_entries);
+				claims.Complete(group.cache_keys[slot], EncodeAnswers(group.answers[slot]));
 				for (auto target : group.targets[slot]) {
 					answers[target] = group.answers[slot];
 					resolved[target] = true;
@@ -672,7 +854,34 @@ static void JevExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 		}
 	}
 
-	// Pass 3: pick the field this function returns out of each answer.
+	// Pass 3: take the answers another query was sending. Our own claims are all complete by
+	// now, so two queries waiting on each other's keys cannot deadlock.
+	for (auto &wait : waits) {
+		auto encoded = wait.answer.get();
+		if (encoded.empty()) {
+			throw IOException("jev: another query was sending the same row and its request failed; run this "
+			                  "query again");
+		}
+		session.stats.shared_in_flight += wait.targets.size();
+		query->current.shared_in_flight += wait.targets.size();
+		auto decoded = DecodeAnswers(encoded);
+		for (auto target : wait.targets) {
+			answers[target] = decoded;
+			resolved[target] = true;
+		}
+	}
+
+	// Pass 4: pick the field this function returns out of each answer.
+	if (prompt_intent) {
+		for (idx_t i = 0; i < count; i++) {
+			if (resolved[i]) {
+				result.SetValue(i, PromptIntentValue(answers[i]));
+			} else {
+				result.SetValue(i, Value(result.GetType()));
+			}
+		}
+		return;
+	}
 	static const vector<string> NO_NAMES;
 	for (idx_t i = 0; i < count; i++) {
 		if (!resolved[i]) {
@@ -707,10 +916,16 @@ static void JevStatsFunction(DataChunk &args, ExpressionState &state, Vector &re
 	report["errors"] = stats.errors.load();
 	report["retries"] = stats.retries.load();
 	report["in_flight"] = stats.in_flight.load();
+	report["shared_in_flight"] = stats.shared_in_flight.load();
+	report["rate_limited_ms"] = stats.rate_limited_ms.load();
 	report["cached_answers"] = session.CachedAnswers();
 	// jev-1.13 list price; output tokens are free.
 	report["estimated_cost_usd"] = static_cast<double>(input_tokens) * 0.042 / 1000000.0;
 	SetConstantString(result, report.dump());
+}
+
+static void JevLastQueryStatsFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	SetConstantString(result, JevQueryState::Get(state.GetContext())->LastQueryJSON());
 }
 
 static void JevCacheClearFunction(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -745,7 +960,38 @@ static ScalarFunction MakeFunction(const char *name, vector<LogicalType> argumen
 	return function;
 }
 
+//! snx_prompt_intent(user_prompt) needs no bind of its own beyond the settings; the questions
+//! are compiled in.
+static unique_ptr<FunctionData> PromptIntentBind(ClientContext &context, ScalarFunction &bound_function,
+                                                 vector<unique_ptr<Expression>> &arguments) {
+	auto data = make_uniq<JevBindData>();
+	data->config = JevConfig::FromContext(context);
+	data->result = JevResult::PROMPT_INTENT;
+	return std::move(data);
+}
+
+static void RegisterGenericFunctions(ExtensionLoader &loader);
+
 void JevRegisterFunctions(ExtensionLoader &loader) {
+	// Always: the one function a process serving generated SQL may call, and this connection's
+	// own spend report.
+	// snx_prompt_intent(user_prompt) -> STRUCT(intent, intent_confidence, intent_probabilities,
+	// malicious_probability). VARCHAR only, so a whole row cannot be passed.
+	loader.RegisterFunction(
+	    MakeFunction("snx_prompt_intent", {LogicalType::VARCHAR}, PromptIntentType(), PromptIntentBind));
+	ScalarFunction last_query_stats("snx_jev_last_query_stats", {}, JevJSONType(), JevLastQueryStatsFunction);
+	last_query_stats.SetStability(FunctionStability::VOLATILE);
+	loader.RegisterFunction(last_query_stats);
+	loader.RegisterFunction(ScalarFunction("jev_version", {}, LogicalType::VARCHAR, JevVersionFunction));
+
+	// Only with SNX_JEV_ENABLE_GENERIC=1 at load: every other function takes its question, or
+	// what it reports, from the caller.
+	if (JevEnvironment::Get().enable_generic) {
+		RegisterGenericFunctions(loader);
+	}
+}
+
+static void RegisterGenericFunctions(ExtensionLoader &loader) {
 	auto any = LogicalType::ANY;
 	auto text = LogicalType::VARCHAR;
 	auto text_list = LogicalType::LIST(LogicalType::VARCHAR);
@@ -801,8 +1047,6 @@ void JevRegisterFunctions(ExtensionLoader &loader) {
 	ScalarFunction cache_clear("jev_cache_clear", {}, LogicalType::BOOLEAN, JevCacheClearFunction);
 	cache_clear.SetStability(FunctionStability::VOLATILE);
 	loader.RegisterFunction(cache_clear);
-
-	loader.RegisterFunction(ScalarFunction("jev_version", {}, LogicalType::VARCHAR, JevVersionFunction));
 }
 
 } // namespace duckdb

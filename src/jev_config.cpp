@@ -113,6 +113,8 @@ static JevEnvironment ResolveEnvironment() {
 
 	auto key = std::getenv("TYPESAFE_API_KEY");
 	environment.api_key = key ? string(key) : string();
+	auto generic = std::getenv("SNX_JEV_ENABLE_GENERIC");
+	environment.enable_generic = generic && string(generic) == "1";
 
 	auto from_env = std::getenv("SNX_JEV_API_URL");
 	string requested = from_env ? string(from_env) : string();
@@ -156,7 +158,7 @@ void JevConfig::RegisterSettings(DBConfig &config) {
 	    Value("jev-latest"));
 	add("snx_jev_threshold", "Probability at which jev() returns true", LogicalType::DOUBLE, Value::DOUBLE(0.5));
 	add("snx_jev_batch_size", "Rows per API request. Accuracy drops measurably above ~20-25", LogicalType::UBIGINT,
-	    Value::UBIGINT(20));
+	    Value::UBIGINT(25));
 	add("snx_jev_concurrency", "Requests in flight at once, across all DuckDB threads", LogicalType::UBIGINT,
 	    Value::UBIGINT(16));
 	add("snx_jev_timeout", "Seconds a single API request may take", LogicalType::DOUBLE, Value::DOUBLE(30.0));
@@ -171,6 +173,9 @@ void JevConfig::RegisterSettings(DBConfig &config) {
 	    LogicalType::UBIGINT, Value::UBIGINT(200000));
 	add("snx_jev_max_value_chars", "Characters of each string in a row that are sent; the rest is cut. 0 = no limit",
 	    LogicalType::UBIGINT, Value::UBIGINT(2000));
+	add("snx_jev_max_requests_per_minute",
+	    "Requests a minute across the whole process, below Jev's 1,200; requests over it wait. 0 = no limit",
+	    LogicalType::UBIGINT, Value::UBIGINT(1000));
 	add("snx_jev_max_batch_tokens",
 	    "Estimated input tokens at which a batch closes, even below snx_jev_batch_size (Jev allows 32k of state)",
 	    LogicalType::UBIGINT, Value::UBIGINT(24000));
@@ -188,9 +193,6 @@ JevConfig JevConfig::FromContext(ClientContext &context) {
 	Value value;
 
 	config.api_key = JevEnvironment::Get().api_key;
-	if (ClientConfig::GetConfig(context).GetUserVariable(CACHE_SCOPE_VARIABLE, value) && !value.IsNull()) {
-		config.cache_scope = value.ToString();
-	}
 
 	if (TryGet(context, "snx_jev_model", value) && !value.ToString().empty()) {
 		config.model = value.ToString();
@@ -222,10 +224,21 @@ JevConfig JevConfig::FromContext(ClientContext &context) {
 	if (TryGet(context, "snx_jev_max_value_chars", value)) {
 		config.max_value_chars = value.GetValue<uint64_t>();
 	}
+	if (TryGet(context, "snx_jev_max_requests_per_minute", value)) {
+		config.max_requests_per_minute = value.GetValue<uint64_t>();
+	}
 	if (TryGet(context, "snx_jev_max_batch_tokens", value)) {
 		config.max_batch_tokens = MaxValue<idx_t>(1, value.GetValue<uint64_t>());
 	}
 	return config;
+}
+
+string JevConfig::CacheScope(ClientContext &context) {
+	Value value;
+	if (ClientConfig::GetConfig(context).GetUserVariable(CACHE_SCOPE_VARIABLE, value) && !value.IsNull()) {
+		return value.ToString();
+	}
+	return string();
 }
 
 void JevConfig::RequireSendable() const {

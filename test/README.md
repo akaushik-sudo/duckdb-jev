@@ -13,6 +13,8 @@ file of its own, guarded by `require-env`, and `scripts/run_tests_with_mock.sh` 
 | `jev_no_key.test` | no key | Nothing is sent without a key |
 | `jev_api.test` | mock + its key | The judgment functions, batching, the cache and its per-customer split, errors |
 | `jev_ask.test` | mock + its key | Label descriptions, `jev_ask` (several questions, one request) and its validation, token-sized batches, truncation |
+| `jev_prompt_intent.test` | mock, **no** `SNX_JEV_ENABLE_GENERIC` | Only `snx_prompt_intent` exists; its type, answers, batching, cache, per-customer scope read at execute (prepared statements), per-query stats, the statement cap, the rate limiter |
+| `jev_concurrency.test` | mock + `SNX_JEV_ENABLE_GENERIC` | Four concurrent queries on the same uncached row send one request |
 | `jev_wrong_key.test` | mock + a wrong key | A 401 is reported as such |
 | `jev_unreachable.test` | a dead loopback port | The spend guard; an unreachable endpoint |
 | `jev_host_refused.test` | ten hostile `SNX_JEV_API_URL`s | Each is refused before a request; several would reach the mock if let through |
@@ -30,7 +32,8 @@ move and no test ever reaches the live API:
 - `noul` answers 0.9 when the last word of the rubric entry's condition occurs in the row JSON, else 0.1
 - `score` picks the level at `len(row_json) % len(levels)`
 - `choice` picks the option at `len(row_json) % len(options)`
-- a rubric text containing `trigger422` answers 422, `trigger503` answers 503
+- a rubric text containing `trigger422` answers 422, `trigger503` answers 503; a row containing
+  `slowmock` takes 1.5 s, so concurrent queries overlap
 - every answer carries `mock_*` fields (descriptions received, row length, rows in the batch) so tests
   can see what was sent
 

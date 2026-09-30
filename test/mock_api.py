@@ -3,8 +3,9 @@
 
 Requests use the compact layout the extension sends:
 
-  state     = {"rubric": {"q0": {...}, "q1": {...}}, "rows": [...]}
-  questions = {"r<row>_q<k>": {"type": ..., "instructions": ..., "criteria": ...}}
+  state     = {"rubric": {"<name>": {"question": ..., "labels" | "levels": ...}},
+               "items":  {"1": <row>, "2": <row>, ...}}
+  questions = {"item_<n>_<name>": {"type": ..., "instructions": ..., "criteria": ...}}
 
 The mock is strict about that shape: a question key that names a missing row or rubric
 entry, a type that disagrees with its rubric entry, or criteria that differ from the
@@ -13,13 +14,14 @@ passing them.
 
 The rules are fixed so the expected results in test/sql/*.test never move:
 
-  noul   -> 0.9 when the LAST word of the rubric entry's condition appears
+  noul   -> 0.9 when the LAST word of the rubric entry's question appears
             (case-insensitively) in the row JSON, else 0.1
   score  -> level index  = length of the row JSON modulo the number of levels
   choice -> option index = length of the row JSON modulo the number of options
 
   A rubric text containing "trigger422" answers 422 (a non-retryable error).
   A rubric text containing "trigger503" answers 503 (retryable, so it exhausts the retries).
+  A row containing "slowmock" makes the response wait 1.5 s, so concurrent queries overlap.
   usage.input_tokens = len(request body) // 4
 
 Every answer also carries fields a real answer does not, so the tests can see what was sent:
@@ -34,10 +36,11 @@ Run: python3 test/mock_api.py [port]        (default 18765)
 import json
 import re
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 API_KEY = "jev-test-key"
-QUESTION_KEY = re.compile(r"^r(\d+)_(q\d+)$")
+QUESTION_KEY = re.compile(r"^item_(\d+)_(.+)$")
 
 
 class BadRequest(Exception):
@@ -45,7 +48,7 @@ class BadRequest(Exception):
 
 
 def rubric_text(entry):
-    return entry.get("condition") or entry.get("question") or ""
+    return entry.get("question") or ""
 
 
 def answer_one(kind, entry, question, row, batch_rows):
@@ -58,7 +61,8 @@ def answer_one(kind, entry, question, row, batch_rows):
         words = rubric_text(entry).split()
         needle = words[-1].lower() if words else ""
         hit = bool(needle) and needle in row_json.lower()
-        extra["mock_described"] = "true_means" in entry and "false_means" in entry
+        labels = entry.get("labels") or {}
+        extra["mock_described"] = "true" in labels and "false" in labels
         return {"type": "noul", "noul": 0.9 if hit else 0.1, **extra}
 
     if kind == "score":
@@ -77,7 +81,7 @@ def answer_one(kind, entry, question, row, batch_rows):
 
     if kind == "choice":
         criteria = question.get("criteria")
-        rubric_options = entry.get("options")
+        rubric_options = entry.get("labels")
         if not isinstance(criteria, dict) or not isinstance(rubric_options, dict):
             raise BadRequest("choice criteria and rubric options must be objects")
         if list(criteria.keys()) != list(rubric_options.keys()) or not criteria:
@@ -109,29 +113,37 @@ class Handler(BaseHTTPRequestHandler):
         try:
             request = json.loads(body)
             state, questions = request["state"], request["questions"]
-            rubric, rows = state["rubric"], state["rows"]
+            rubric, items = state["rubric"], state["items"]
+            if list(items) != [str(i + 1) for i in range(len(items))]:
+                raise BadRequest("items must be keyed 1..n in order")
             texts = " ".join(rubric_text(entry) for entry in rubric.values())
             if "trigger422" in texts:
                 return self._send(422, {"error": "mock validation failure"})
             if "trigger503" in texts:
                 return self._send(503, {"error": "mock overloaded"})
 
-            expected = {"r%d_%s" % (i, q) for i in range(len(rows)) for q in rubric}
+            if "slowmock" in json.dumps(items):
+                time.sleep(1.5)
+
+            expected = {"item_%s_%s" % (n, q) for n in items for q in rubric}
             if set(questions) != expected:
-                raise BadRequest("questions must be exactly one per (row, rubric entry)")
+                raise BadRequest("questions must be exactly one per (item, rubric entry)")
 
             answers = {}
             for question_id, question in questions.items():
                 match = QUESTION_KEY.match(question_id)
-                index, rubric_key = int(match.group(1)), match.group(2)
+                item, rubric_key = match.group(1), match.group(2)
                 entry = rubric[rubric_key]
-                if question.get("type") != entry.get("type"):
-                    raise BadRequest(question_id + ": type differs from its rubric entry")
-                if "`rubric.%s`" % rubric_key not in question.get("instructions", ""):
+                kind = question.get("type")
+                if kind == "choice" and "labels" not in entry:
+                    raise BadRequest(question_id + ": a choice needs labels in its rubric entry")
+                if kind == "score" and "levels" not in entry:
+                    raise BadRequest(question_id + ": a score needs levels in its rubric entry")
+                if "rubric.%s" % rubric_key not in question.get("instructions", ""):
                     raise BadRequest(question_id + ": instructions do not point at its rubric entry")
-                if "`rows[%d]`" % index not in question.get("instructions", ""):
-                    raise BadRequest(question_id + ": instructions do not point at its row")
-                answers[question_id] = answer_one(entry["type"], entry, question, rows[index], len(rows))
+                if 'items."%s"' % item not in question.get("instructions", ""):
+                    raise BadRequest(question_id + ": instructions do not point at its item")
+                answers[question_id] = answer_one(kind, entry, question, items[item], len(items))
         except (BadRequest, KeyError, TypeError, ValueError, AttributeError) as error:
             return self._send(422, {"error": "mock: bad request: " + str(error)})
 

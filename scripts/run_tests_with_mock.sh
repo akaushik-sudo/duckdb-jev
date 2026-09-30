@@ -45,16 +45,19 @@ CASES=()
 case_() { CASES+=("$*"); }
 
 # No key and no endpoint override: what any environment can check
-case_ test/sql/jev_offline.test
-case_ test/sql/jev_no_key.test JEV_ASSERT_NO_API_KEY=1 SNX_JEV_API_URL="$mock_url"
+case_ test/sql/jev_offline.test SNX_JEV_ENABLE_GENERIC=1
+case_ test/sql/jev_no_key.test SNX_JEV_ENABLE_GENERIC=1 JEV_ASSERT_NO_API_KEY=1 SNX_JEV_API_URL="$mock_url"
 
 # The judgment functions against the mock
-case_ test/sql/jev_api.test JEV_MOCK_API_URL="$mock_url" SNX_JEV_API_URL="$mock_url" TYPESAFE_API_KEY="$MOCK_KEY"
-case_ test/sql/jev_ask.test JEV_MOCK_API_URL="$mock_url" SNX_JEV_API_URL="$mock_url" TYPESAFE_API_KEY="$MOCK_KEY"
-case_ test/sql/jev_wrong_key.test JEV_ASSERT_WRONG_KEY=1 SNX_JEV_API_URL="$mock_url" TYPESAFE_API_KEY=not-the-key
+case_ test/sql/jev_api.test SNX_JEV_ENABLE_GENERIC=1 JEV_MOCK_API_URL="$mock_url" SNX_JEV_API_URL="$mock_url" TYPESAFE_API_KEY="$MOCK_KEY"
+case_ test/sql/jev_ask.test SNX_JEV_ENABLE_GENERIC=1 JEV_MOCK_API_URL="$mock_url" SNX_JEV_API_URL="$mock_url" TYPESAFE_API_KEY="$MOCK_KEY"
+# The environment search runs in: no SNX_JEV_ENABLE_GENERIC, only snx_prompt_intent
+case_ test/sql/jev_prompt_intent.test JEV_ASSERT_PROMPT_INTENT_ONLY=1 SNX_JEV_API_URL="$mock_url" TYPESAFE_API_KEY="$MOCK_KEY"
+case_ test/sql/jev_concurrency.test SNX_JEV_ENABLE_GENERIC=1 JEV_MOCK_API_URL="$mock_url" SNX_JEV_API_URL="$mock_url" TYPESAFE_API_KEY="$MOCK_KEY"
+case_ test/sql/jev_wrong_key.test SNX_JEV_ENABLE_GENERIC=1 JEV_ASSERT_WRONG_KEY=1 SNX_JEV_API_URL="$mock_url" TYPESAFE_API_KEY=not-the-key
 
 # A loopback port nothing listens on
-case_ test/sql/jev_unreachable.test JEV_ASSERT_UNREACHABLE=1 SNX_JEV_API_URL="http://127.0.0.1:1/v1/systemone" \
+case_ test/sql/jev_unreachable.test SNX_JEV_ENABLE_GENERIC=1 JEV_ASSERT_UNREACHABLE=1 SNX_JEV_API_URL="http://127.0.0.1:1/v1/systemone" \
     TYPESAFE_API_KEY="$MOCK_KEY"
 
 # Endpoints that must be refused. The ones that name the mock's port would reach it if the
@@ -78,7 +81,7 @@ for hostile in \
     "http://127.0.0.1:${PORT}/v1/%2e%2e/systemone" \
     "ftp://127.0.0.1:${PORT}/v1/systemone" \
     "127.0.0.1:${PORT}/v1/systemone"; do
-  case_ test/sql/jev_host_refused.test JEV_ASSERT_HOST_REFUSED=1 SNX_JEV_API_URL="$hostile" TYPESAFE_API_KEY="$MOCK_KEY"
+  case_ test/sql/jev_host_refused.test SNX_JEV_ENABLE_GENERIC=1 JEV_ASSERT_HOST_REFUSED=1 SNX_JEV_API_URL="$hostile" TYPESAFE_API_KEY="$MOCK_KEY"
 done
 
 # A test file with no case would never run here, and `make test` skips it for lack of its
@@ -115,7 +118,8 @@ run() {
   echo "== ${test_file} $*"
   env -u TYPESAFE_API_KEY -u SNX_JEV_API_URL \
       -u JEV_MOCK_API_URL -u JEV_ASSERT_NO_API_KEY -u JEV_ASSERT_WRONG_KEY \
-      -u JEV_ASSERT_UNREACHABLE -u JEV_ASSERT_HOST_REFUSED \
+      -u JEV_ASSERT_UNREACHABLE -u JEV_ASSERT_HOST_REFUSED -u JEV_ASSERT_PROMPT_INTENT_ONLY \
+      -u SNX_JEV_ENABLE_GENERIC \
       "$@" "$unittest" --test-dir . "$test_file"
 }
 

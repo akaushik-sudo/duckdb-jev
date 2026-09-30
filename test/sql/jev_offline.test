@@ -26,7 +26,7 @@ jev-latest
 query I
 SELECT current_setting('snx_jev_batch_size');
 ----
-20
+25
 
 statement ok
 SET snx_jev_batch_size = 40;
