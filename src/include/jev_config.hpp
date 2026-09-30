@@ -24,6 +24,10 @@ struct JevEnvironment {
 	string refusal;
 	//! TYPESAFE_API_KEY as it was at load; empty when unset.
 	string api_key;
+	//! SNX_JEV_ENABLE_GENERIC=1 at load: also register the general-purpose jev_* functions.
+	//! Off by default, so a process that serves generated SQL (search) has only
+	//! snx_prompt_intent. SQL cannot turn it on: it is read once, from the environment.
+	bool enable_generic = false;
 
 	//! Resolved once, on first use (the extension calls it at load).
 	static const JevEnvironment &Get();
@@ -37,13 +41,9 @@ struct JevConfig {
 	//! JevEnvironment::Get().api_key. There is deliberately no setting for it: a setting's
 	//! value can be read back by any query through current_setting() / duckdb_settings().
 	string api_key;
-	//! Namespaces the answer cache: the connection's `scope_customer_id` variable, which
-	//! the search service sets from the verified token. Empty when the variable is unset
-	//! (a hand-run session), which is a namespace of its own.
-	string cache_scope;
 	string model = "jev-latest";
 	double threshold = 0.5;
-	idx_t batch_size = 20;
+	idx_t batch_size = 25;
 	idx_t concurrency = 16;
 	double timeout = 30.0;
 	idx_t max_retries = 6;
@@ -55,11 +55,19 @@ struct JevConfig {
 	//! A batch closes before its estimated input tokens pass this, even under batch_size.
 	//! Jev allows 32k tokens of state (plus the longest question) and 64k per request.
 	idx_t max_batch_tokens = 24000;
+	//! Process-wide ceiling on requests a minute, below Jev's 1,200 (0 = no limit).
+	idx_t max_requests_per_minute = 1000;
 
 	//! Registers the settings on the database config. Called once, when the extension loads.
 	static void RegisterSettings(DBConfig &config);
 	//! Resolves the settings as they stand for this query.
 	static JevConfig FromContext(ClientContext &context);
+	//! Namespaces the answer cache: the connection's `scope_customer_id` variable, which the
+	//! search service sets from the verified token; "" when unset (a hand-run session), which
+	//! is a namespace of its own. Read when the query runs, not when it is bound: DuckDB does
+	//! not rebind a prepared statement when a variable changes, so a scope captured at bind
+	//! would follow a re-pinned connection's statement into the wrong customer's namespace.
+	static string CacheScope(ClientContext &context);
 	//! Throws if the endpoint was refused or no API key was configured. Called when a
 	//! request is about to be sent, never at bind time, so a query answered entirely from
 	//! cache needs neither.

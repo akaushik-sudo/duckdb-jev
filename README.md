@@ -6,17 +6,26 @@
 > [judoaseeta/duckdb-jev](https://github.com/judoaseeta/duckdb-jev) (MIT, forked at 0.1.0,
 > `58e5484`). The extension and its settings are renamed so they cannot be mistaken for the
 > community `jev` extension, and it is pinned to the DuckDB version the analytics services run
-> (v1.5.4). The functions still carry upstream's names (`jev`, `jev_prob`, ...), so **do not load
-> it into a process that also loads community `jev`**: the second LOAD fails on the duplicate
-> functions. P3 replaces them with `snx_prompt_intent`. It is being
-> narrowed to one hardened function, `snx_prompt_intent`, for classifying `ai_txn` prompts. Until
-> that lands, everything below describes the upstream functions, unchanged apart from the extension name.
-> `upstream` in a clone is judoaseeta's repo; nothing is pushed there.
+> (v1.5.4). `upstream` in a clone is judoaseeta's repo; nothing is pushed there.
+>
+> By default it registers **one** question-asking function, `snx_prompt_intent(user_prompt)`, with the
+> prompt intent taxonomy compiled in, which is what the analytics search service loads. The general
+> functions below (`jev`, `jev_prob`, `jev_choice`, `jev_ask`, ...) exist only when the process starts
+> with `SNX_JEV_ENABLE_GENERIC=1`. They keep upstream's names, so **with that flag, do not load it
+> into a process that also loads community `jev`**: the second LOAD fails on the duplicate functions.
 
 ```sql
 -- TYPESAFE_API_KEY is set in the environment DuckDB started with
 LOAD snx_jev;
 
+SELECT r.intent, count(*) AS prompts, count(*) FILTER (r.malicious_probability >= 0.5) AS malicious
+FROM (SELECT snx_prompt_intent(user_prompt) AS r FROM v_ai_txn WHERE user_id = 42)
+GROUP BY ALL;
+```
+
+With `SNX_JEV_ENABLE_GENERIC=1`, any question about any row:
+
+```sql
 SELECT * FROM people WHERE jev(people, 'the name is European');
 
 SELECT subject, jev_prob(tickets, 'the customer is angry') AS p
@@ -46,29 +55,59 @@ a query moves between the two by changing `jev.batch_size` into `snx_jev_batch_s
 1. `jev(table, 'condition')` receives the row as a struct. DuckDB hands a scalar function a whole vector
    of rows at a time (up to 2048), which is the batch — there is no read-ahead machinery to speak of,
    because the executor already delivers rows in bulk.
-2. Rows are packed `snx_jev_batch_size` (20) per request into one shared *state*,
-   `{"rubric": {"q0": <the question in full>, ...}, "rows": [...]}`, with one short question per
-   (row, question) that points at its rubric entry and its row (`r3_q0`: "Answer `rubric.q0` for the
-   record `rows[3]`"). The model evaluates all the questions over that one state, which amortises the
-   per-request overhead: 20 rows in one request cost far less than 20 requests of one row. Writing
-   each question once, in the rubric, instead of once per row is the *compact* layout; against the
-   live API it cut input tokens by ~70% at the same accuracy.
+2. Rows are packed `snx_jev_batch_size` (25) per request into one shared *state*,
+   `{"rubric": {"<name>": <the question in full>, ...}, "items": {"1": <row>, "2": <row>, ...}}`, with
+   one short question per (item, question) that points at both (`item_3_intent`: "Using rubric.intent
+   in the state, classify items."3"."). The model evaluates all the questions over that one state,
+   which amortises the per-request overhead: 25 rows in one request cost far less than 25 requests of
+   one row. Writing each question once, in the rubric, instead of once per row is the *compact*
+   layout; against the live API it cut input tokens by ~70% at the same accuracy. The wording is the
+   one measured: a pointer with meaningful names and keyed items scored clearly better than one with
+   `rows[i]` positions and abstract keys (see `docs/PLAN.md`, P3).
 3. A batch also closes early, before its estimated input tokens pass `snx_jev_max_batch_tokens`
    (24000; Jev allows 32k of state), and every string in a row is cut to `snx_jev_max_value_chars`
    (2000) characters first, so no batch outgrows the context window.
 4. `snx_jev_concurrency` (16) requests are in flight at once, over connections that are kept alive. The
-   ceiling is process-wide, so it still holds when DuckDB runs the scan on several threads.
+   ceiling is process-wide, so it still holds when DuckDB runs the scan on several threads. A
+   process-wide token bucket, `snx_jev_max_requests_per_minute` (1000, below Jev's 1,200), paces them,
+   so a large query slows down instead of meeting 429s.
+   Two queries (or two scan threads) that meet the same uncached row at once send it once: one sends,
+   the other waits for that answer.
 5. Answers are cached by row content for as long as the process lives, so re-running a query, changing
    the threshold or sorting by probability is free. Rows that a cheaper predicate rejects first
    (`WHERE age > 60 AND jev(...)`) are never judged, and a `LIMIT` stops the scan early.
 
-### Why 20 rows per request
+### Why 25 rows per request
 
-The measurement comes from pg-jev, and the model is the same one: the model has to find `rows[i]` by
-position, and that gets unreliable in long arrays. Against ground truth from structured columns, batches
-of 1-20 rows were 100 % correct, batches of 40 were 92-98 % and batches of 80 were 77-94 %. Batches of 20
-cost about 4 % more tokens than batches of 40 and are just as fast, because a request's latency barely
-depends on its size.
+pg-jev measured, against ground truth from structured columns, batches of 1-20 rows at 100 % correct,
+40 at 92-98 % and 80 at 77-94 %: the model has to find each row in the state, which gets unreliable in
+long batches. Our own Phase 1 run held its accuracy at 32. 25 sits inside both, and a request's latency
+barely depends on its size.
+
+## snx_prompt_intent
+
+```sql
+snx_prompt_intent(user_prompt VARCHAR)
+  -> STRUCT(intent VARCHAR,                          -- 'work_related' | 'personal' | 'other'
+            intent_confidence DOUBLE,
+            intent_probabilities MAP(VARCHAR, DOUBLE),
+            malicious_probability DOUBLE)             -- P(the prompt tries to misuse the assistant)
+```
+
+- The questions, labels, descriptions and wording are compiled in (the prompt intent spec §1). SQL
+  chooses only which prompts to classify, not what is asked.
+- Text only: passing a row or a struct is a binder error, so a query cannot send other columns.
+- NULL in, NULL out, nothing sent. A field the API did not answer is NULL, never `'other'` or 0.
+- Both questions go in one request, 25 prompts at a time. Measured on the 50-prompt Phase 1 set
+  (`jev-1.13.0`): intent 98 % correct, every malicious prompt ≥ 0.92 and every other ≤ 0.07,
+  ~138 input tokens (≈ $0.0000058) per prompt.
+- `intent` of a purely malicious prompt is not meaningful (it reads `work_related`); lead with
+  `malicious_probability` for those.
+
+`snx_jev_last_query_stats()` reports what the last query on this connection that used the
+extension sent: `requests`, `rows_sent`, `cache_hits`, `shared_in_flight`, `retries`,
+`rate_limited_ms`, `input_tokens`, `estimated_cost_usd`. It is per connection, so it never shows
+another caller's spend.
 
 ## Install
 
@@ -113,6 +152,9 @@ path), for the test mock. Any other value is refused, and every request then fai
 before a connection is opened. The refusal does not repeat the value, which could carry credentials.
 
 ## Functions
+
+Registered only with `SNX_JEV_ENABLE_GENERIC=1` at LOAD (SQL cannot turn it on); `jev_version()`
+is always there.
 
 | Function | Returns | Purpose |
 | --- | --- | --- |
@@ -187,8 +229,9 @@ silently different question. The answers come back in the order the questions we
 | --- | --- | --- |
 | `snx_jev_model` | `jev-latest` | Model name, or a pinned version such as `jev-1.13.0` |
 | `snx_jev_threshold` | `0.5` | Probability at which `jev()` returns true |
-| `snx_jev_batch_size` | `20` | Rows per request. Accuracy drops measurably above ~20-25 |
+| `snx_jev_batch_size` | `25` | Rows per request. Accuracy drops measurably above ~20-25 |
 | `snx_jev_concurrency` | `16` | Requests in flight at once, process-wide |
+| `snx_jev_max_requests_per_minute` | `1000` | Process-wide pace (token bucket, burst of 1/20 of it); `0` = none |
 | `snx_jev_timeout` | `30` | Seconds a single request may take |
 | `snx_jev_max_retries` | `6` | Attempts for a retryable failure (429, 5xx, a dropped connection) |
 | `snx_jev_max_rows_per_statement` | `0` (off) | Refuse a statement that would send more rows than this |
@@ -201,8 +244,9 @@ Settings are read once per statement, so a `SET` applies to the next query and n
 The key and the endpoint are not settings; see above.
 
 The answer cache is shared by the whole process, split by the connection's `scope_customer_id`
-variable (which the analytics search service sets from the caller's verified token). One customer's
-answers are never another customer's cache hit.
+variable (which the analytics search service sets from the caller's verified token), read when the
+query runs, so a prepared statement follows a re-pinned connection. One customer's answers are never
+another customer's cache hit.
 
 ## Writing good conditions
 

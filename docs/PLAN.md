@@ -93,6 +93,29 @@ What landed:
 
 ## P3 — `snx_prompt_intent(user_prompt)`, the only public function
 
+**Done.** What landed, beyond the list below:
+
+- `snx_prompt_intent(VARCHAR)`, `snx_jev_last_query_stats()` and `jev_version()` are always registered;
+  everything else only with `SNX_JEV_ENABLE_GENERIC=1` at LOAD. Tests run the prompt-intent suite without it.
+- Request layout back to Phase 1's measured shape for **every** function: named rubric entries
+  (`rubric.intent`), keyed items (`items."3"`), pointers "Using rubric.X in the state, classify items."n"."
+  and, for the malicious question, "... is items."n" malicious?". Questions carry a `name` (jev_ask: the
+  caller's; snx_prompt_intent: intent / malicious) and an optional pointer template.
+- Engine: batch 25; the rate limiter; single-flight (`JevState::LookupOrClaim` / `Complete`, with every
+  claim completed even when the statement throws); the cache scope read at execute.
+
+**Live runs on the Phase 1 set (`jev-1.13.0`, 2 requests each, ≈ $0.0008 for all three):**
+
+| Layout | Intent | Malicious caught / false alarms | Lowest malicious / highest other | Tokens / prompt |
+|---|---|---|---|---|
+| Phase 1 compact 32 (spec §11) | 92% | 10/10, 0 | 0.92 / ≤ 0.2 | 138 |
+| P2 (`rows[i]`, `q0` keys, "satisfy the condition") | 90% | 10/10, 0 | 0.61 / 0.13 | 113.5 |
+| P3 first try (same, malicious as a statement) | 86% | 9/10, 0 | 0.37 / 0.13 | 113.5 |
+| **P3 final (Phase 1 layout)** | **98%** | **10/10, 0** | **0.92 / 0.07** | 137.6 |
+
+The ~20% token saving of the P2 wording cost the malicious margin, so the measured layout wins. The one
+remaining intent miss is the known case (a phishing-email request reads `work_related`, P(mal) 0.98).
+
 ```sql
 snx_prompt_intent(user_prompt VARCHAR)
   -> STRUCT(intent VARCHAR, intent_confidence DOUBLE,
@@ -109,8 +132,40 @@ snx_prompt_intent(user_prompt VARCHAR)
 - Read the cache scope (`scope_customer_id`) when the query **runs**, not at bind: DuckDB does not
   rebind a prepared statement when a variable changes, so a statement prepared under one customer and
   run after the connection is re-pinned would use the old customer's namespace.
-- The generic `jev`, `jev_prob`, `jev_choice`, `jev_score`, `jev_score_norm`, `jev_confidence`
-  and `jev_eval` are **not registered**. `jev_stats` / `jev_cache_clear` stay off the search path too.
+- The generic `jev`, `jev_prob`, `jev_choice`, `jev_score`, `jev_score_norm`, `jev_confidence`,
+  `jev_eval` and `jev_ask`, and the process-wide `jev_stats` / `jev_cache_clear`, are registered only
+  when `SNX_JEV_ENABLE_GENERIC=1` is in the environment at LOAD (analysts' machines). Search never sets
+  it, so none of them exists there. One binary, not a dev and a prod build.
+- `snx_jev_last_query_stats()`: requests, tokens, prompts sent, cache hits and waits of the last query
+  on **this connection** that used the extension, so search can report and log spend (`LlmSpend`).
+- The live check's narrower malicious margin: the compiled malicious question is phrased as a
+  condition (a statement), which is what the noul pointer ("satisfy the condition in ...") expects.
+  Re-check with one 2-request run on the Phase 1 set.
+
+### Throughput (decided 2026-09-30)
+
+A breakdown ("alice's work vs personal") classifies every distinct prompt in the slice, so volume is
+the constraint, not parallelism. At 25 prompts a request and ~113 tokens a prompt:
+
+| Distinct prompts | Requests | Floor at 1,200 req/min | Cost |
+|---|---|---|---|
+| 1,000 | 40 | ~2 s | $0.005 |
+| 100,000 | 4,000 | 3.3 min | $0.47 |
+
+- **Batch 25** is the default `snx_jev_batch_size` (upstream measured accuracy dropping above ~20-25).
+- **Parallel:** batches already go out on a process-wide pool (`snx_jev_concurrency`, 16), however many
+  threads DuckDB scans with.
+- **Rate limiter:** a process-wide token bucket (`snx_jev_max_requests_per_minute`, default 1000, below
+  Jev's 1,200), so 16 parallel requests pace themselves instead of meeting 429s.
+- **Single-flight:** when two queries (or two scan threads) meet the same uncached prompt at once, one
+  sends it and the other waits for that answer, instead of paying twice.
+- **Cap and estimate (search, P5):** at most **1,000 distinct prompts are sent per search**
+  (`snx_jev_max_rows_per_statement = 1000`, set and locked in search's `connect.sql`). Above that,
+  search classifies a deterministic sample of 1,000 distinct prompts (lowest `hash(user_prompt)`
+  first, so the same question gets the same sample) and reports an estimate: "estimated from 1,000 of
+  48,213 prompts: work 71% ± 3%" (95% interval at n = 1,000 is at most ±3.1 points). The user accepted
+  estimates for large slices; exact counts at any size would need classifying prompts as they arrive
+  (persisted labels), which is not planned.
 - **Encryption, when sgwe implements it:** `user_prompt` would hold ciphertext. That leaks no
   plaintext, but it wastes calls on meaningless labels. Decide then between skipping rows that have
   a key id and keeping ciphertext in its own column.
@@ -133,6 +188,9 @@ snx_prompt_intent(user_prompt VARCHAR)
   and it must be tested with the real lake. If that cannot be made to work, change the key source
   (a file outside the allowed paths, or handed over by search's Java at startup) before rollout.
 - Teach `ai_log_search.yaml` when to call `snx_prompt_intent(user_prompt)`; add eval cases against the mock.
+- Breakdown query shape: classify **distinct** prompts, then join back and count; above 1,000 distinct,
+  take the deterministic sample and scale, and say so in the answer (see P3 Throughput). The
+  statement cap is the backstop if the generated SQL forgets to sample.
 - CI guard: `http_client` stays banned; `snx_jev` is allowed only in search's connect.sql.
 - Retire `ollylake/jev/jev_macros.sql` (branch `demo/prompt-jev-batch`).
 

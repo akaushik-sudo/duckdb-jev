@@ -10,6 +10,13 @@ namespace duckdb {
 
 //! One question, asked of every row in a batch.
 struct JevQuestion {
+	//! Its key in the rubric and in the answers: "q" for the single-question functions, the
+	//! caller's name in jev_ask, "intent" / "malicious" for snx_prompt_intent. A meaningful
+	//! name is part of what the model reads ("Using rubric.malicious ...").
+	string name = "q";
+	//! Per-item instructions, with {rubric} and {item} filled in; empty for the default
+	//! wording of the kind.
+	string pointer;
 	//! "noul" (yes/no probability), "score" (ordered levels) or "choice" (one of n)
 	string kind;
 	//! The condition or question, in plain language
@@ -35,10 +42,20 @@ struct JevQuestionSet {
 	string CacheKey() const;
 };
 
+//! What one batch came back with.
+struct JevCallResult {
+	//! answers[row][question]: the raw answer JSON, in the order given
+	vector<vector<string>> answers;
+	uint64_t input_tokens = 0;
+	uint64_t output_tokens = 0;
+	uint64_t retries = 0;
+	uint64_t rate_limited_ms = 0;
+};
+
 //! Judges one batch of rows: one request, one shared state, one question per (row, question).
-//! Returns the raw answer JSON per row and question: result[row][question], in the order given.
-//! Retries the retryable failures (429, 5xx, dropped connections) and throws otherwise.
-vector<vector<string>> JevCallAPI(const JevConfig &config, const JevQuestionSet &set, const vector<string> &rows_json);
+//! Every attempt first waits for the process-wide rate limit. Retries the retryable failures
+//! (429, 5xx, dropped connections) and throws otherwise.
+JevCallResult JevCallAPI(const JevConfig &config, const JevQuestionSet &set, const vector<string> &rows_json);
 
 //! Size of a request for `set`, so batches can be closed before they outgrow the API's
 //! context window: the request with no rows, and what each row adds on top of its own JSON.

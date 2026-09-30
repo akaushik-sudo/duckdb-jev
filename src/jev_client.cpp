@@ -19,7 +19,8 @@ namespace http = duckdb_jev_httplib;
 using nlohmann::ordered_json;
 
 string JevQuestion::CacheKey() const {
-	string key = kind + "\x1f" + query;
+	// The name and the pointer wording are part of what is sent, so part of the key.
+	string key = name + "\x1c" + pointer + "\x1c" + kind + "\x1f" + query;
 	for (auto &option : options) {
 		key += "\x1f";
 		key += option;
@@ -62,33 +63,33 @@ static http::Client &GetClient(const string &origin, const JevConfig &config) {
 	return *entry->second;
 }
 
-static string RubricKey(idx_t question) {
-	return "q" + to_string(question);
+//! Items are keyed "1", "2", ... in the state; the model finds an item by key more reliably
+//! than by array position.
+static string ItemKey(idx_t row) {
+	return to_string(row + 1);
 }
 
-static string AnswerKey(idx_t row, idx_t question) {
-	return "r" + to_string(row) + "_" + RubricKey(question);
+static string AnswerKey(const JevQuestionSet &set, idx_t row, idx_t question) {
+	return "item_" + ItemKey(row) + "_" + set.questions[question].name;
 }
 
-//! One question in full, written into the state once per request: its text, and for a
-//! choice every label with its description. Every row's question points here instead of
-//! repeating it (the compact layout: about 70% fewer input tokens than repeating the full
-//! question per row, at the same accuracy, measured against the live API).
+static string Replace(string text, const string &from, const string &to) {
+	idx_t at = 0;
+	while ((at = text.find(from, at)) != string::npos) {
+		text.replace(at, from.size(), to);
+		at += to.size();
+	}
+	return text;
+}
+
+//! One question in full, written into the state once per request: its text, and every label
+//! with its description. Every item's question points here instead of repeating it (the
+//! compact layout: about 70% fewer input tokens than repeating the full question per item, at
+//! the same accuracy, measured against the live API).
 static void WriteRubricEntry(const JevQuestion &question, string &out) {
-	out += "{\"type\":";
-	JevWriteJSONString(question.kind, out);
-	if (question.kind == "noul") {
-		out += ",\"condition\":";
-		JevWriteJSONString(question.query, out);
-		if (question.descriptions.size() == 2) {
-			out += ",\"true_means\":";
-			JevWriteJSONString(question.descriptions[0], out);
-			out += ",\"false_means\":";
-			JevWriteJSONString(question.descriptions[1], out);
-		}
-	} else if (question.kind == "score") {
-		out += ",\"question\":";
-		JevWriteJSONString(question.query, out);
+	out += "{\"question\":";
+	JevWriteJSONString(question.query, out);
+	if (question.kind == "score") {
 		out += ",\"levels\":[";
 		for (idx_t i = 0; i < question.options.size(); i++) {
 			if (i > 0) {
@@ -97,10 +98,8 @@ static void WriteRubricEntry(const JevQuestion &question, string &out) {
 			JevWriteJSONString(question.options[i], out);
 		}
 		out += ']';
-	} else {
-		out += ",\"question\":";
-		JevWriteJSONString(question.query, out);
-		out += ",\"options\":{";
+	} else if (question.kind == "choice") {
+		out += ",\"labels\":{";
 		for (idx_t i = 0; i < question.options.size(); i++) {
 			if (i > 0) {
 				out += ',';
@@ -114,22 +113,36 @@ static void WriteRubricEntry(const JevQuestion &question, string &out) {
 			}
 		}
 		out += '}';
+	} else if (question.descriptions.size() == 2) {
+		out += ",\"labels\":{\"true\":";
+		JevWriteJSONString(question.descriptions[0], out);
+		out += ",\"false\":";
+		JevWriteJSONString(question.descriptions[1], out);
+		out += '}';
 	}
 	out += '}';
 }
 
-//! The per-row question: a pointer to the rubric entry and to the row, plus the bare
-//! criteria the answer has to use.
-static void WriteRowQuestion(const JevQuestion &question, idx_t question_index, idx_t row, string &out) {
-	auto rubric = "`rubric." + RubricKey(question_index) + "`";
-	auto row_ref = "`rows[" + to_string(row) + "]`";
+//! The per-item question: a pointer to the rubric entry and to the item, plus the criteria
+//! the answer has to use. The wording is the one measured against the live API in Phase 1.
+static void WriteItemQuestion(const JevQuestion &question, idx_t row, string &out) {
+	auto rubric = "rubric." + question.name;
+	auto item = "items.\"" + ItemKey(row) + "\"";
+	string instructions;
+	if (!question.pointer.empty()) {
+		instructions = Replace(Replace(question.pointer, "{rubric}", rubric), "{item}", item);
+	} else if (question.kind == "noul") {
+		instructions = "Using " + rubric + " in the state: is it true of " + item + "?";
+	} else if (question.kind == "score") {
+		instructions = "Using " + rubric + " in the state, rate " + item + ".";
+	} else {
+		instructions = "Using " + rubric + " in the state, classify " + item + ".";
+	}
 	out += "{\"type\":";
 	JevWriteJSONString(question.kind, out);
 	out += ",\"instructions\":";
-	if (question.kind == "noul") {
-		JevWriteJSONString("Does the record " + row_ref + " satisfy the condition in " + rubric + "?", out);
-	} else if (question.kind == "score") {
-		JevWriteJSONString("Answer " + rubric + " for the record " + row_ref + ".", out);
+	JevWriteJSONString(instructions, out);
+	if (question.kind == "score") {
 		out += ",\"criteria\":[";
 		for (idx_t i = 0; i < question.options.size(); i++) {
 			if (i > 0) {
@@ -138,25 +151,24 @@ static void WriteRowQuestion(const JevQuestion &question, idx_t question_index, 
 			JevWriteJSONString(question.options[i], out);
 		}
 		out += ']';
-	} else {
-		JevWriteJSONString("Answer " + rubric + " for the record " + row_ref + ", using its options.", out);
+	} else if (question.kind == "choice") {
 		out += ",\"criteria\":{";
 		for (idx_t i = 0; i < question.options.size(); i++) {
 			if (i > 0) {
 				out += ',';
 			}
 			JevWriteJSONString(question.options[i], out);
-			out += ":null";
+			out += ":\"see rubric\"";
 		}
 		out += '}';
 	}
 	out += '}';
 }
 
-//! The request every batch sends: one state holding the rubric and all the rows, and one
-//! question per (row, question) that refers to both by key. The model answers them over the
-//! one state, which is what makes a batch cheaper than the same rows sent one at a time,
-//! and what lets a second question on the same row ride in the same request.
+//! The request every batch sends: one state holding the rubric and every item, and one
+//! question per (item, question) that refers to both by key. The model answers them over the
+//! one state, which is what makes a batch cheaper than the same rows sent one at a time, and
+//! what lets a second question on the same item ride in the same request.
 static string BuildRequestBody(const JevConfig &config, const JevQuestionSet &set, const vector<string> &rows_json) {
 	string body = "{\"model\":";
 	JevWriteJSONString(config.model, body);
@@ -165,18 +177,20 @@ static string BuildRequestBody(const JevConfig &config, const JevQuestionSet &se
 		if (q > 0) {
 			body += ',';
 		}
-		JevWriteJSONString(RubricKey(q), body);
+		JevWriteJSONString(set.questions[q].name, body);
 		body += ':';
 		WriteRubricEntry(set.questions[q], body);
 	}
-	body += "},\"rows\":[";
+	body += "},\"items\":{";
 	for (idx_t i = 0; i < rows_json.size(); i++) {
 		if (i > 0) {
 			body += ',';
 		}
+		JevWriteJSONString(ItemKey(i), body);
+		body += ':';
 		body += rows_json[i];
 	}
-	body += "]},\"questions\":{";
+	body += "}},\"questions\":{";
 	bool first = true;
 	for (idx_t i = 0; i < rows_json.size(); i++) {
 		for (idx_t q = 0; q < set.questions.size(); q++) {
@@ -184,9 +198,9 @@ static string BuildRequestBody(const JevConfig &config, const JevQuestionSet &se
 				body += ',';
 			}
 			first = false;
-			JevWriteJSONString(AnswerKey(i, q), body);
+			JevWriteJSONString(AnswerKey(set, i, q), body);
 			body += ':';
-			WriteRowQuestion(set.questions[q], q, i, body);
+			WriteItemQuestion(set.questions[q], i, body);
 		}
 	}
 	body += "}}";
@@ -240,7 +254,7 @@ static double Jitter() {
 	return distribution(generator);
 }
 
-vector<vector<string>> JevCallAPI(const JevConfig &config, const JevQuestionSet &set, const vector<string> &rows_json) {
+JevCallResult JevCallAPI(const JevConfig &config, const JevQuestionSet &set, const vector<string> &rows_json) {
 	config.RequireSendable();
 
 	// RequireSendable() has checked it was not refused; origin is canonical scheme://host:port.
@@ -250,11 +264,17 @@ vector<vector<string>> JevCallAPI(const JevConfig &config, const JevQuestionSet 
 	auto body = BuildRequestBody(config, set, rows_json);
 	http::Headers headers = {{"Authorization", "Bearer " + config.api_key}, {"User-Agent", "snx-jev/" JEV_VERSION}};
 
-	auto &stats = JevState::Get().stats;
+	auto &session = JevState::Get();
+	auto &stats = session.stats;
+	uint64_t retries = 0;
+	uint64_t rate_limited_ms = 0;
 	string last_error = "no attempt was made";
 	double delay = 0.5;
 
 	for (idx_t attempt = 0; attempt < config.max_retries; attempt++) {
+		// Paced before every attempt, retries included, so parallel requests stay under Jev's
+		// limit instead of meeting it as 429s.
+		rate_limited_ms += session.AcquireRequestPermit(config.max_requests_per_minute);
 		auto &client = GetClient(origin, config);
 		auto started = std::chrono::steady_clock::now();
 		auto response = client.Post(path, headers, body, "application/json");
@@ -267,6 +287,7 @@ vector<vector<string>> JevCallAPI(const JevConfig &config, const JevQuestionSet 
 			// immediate retry; the rest back off.
 			last_error = http::to_string(response.error());
 			stats.retries++;
+			retries++;
 			if (attempt + 1 < config.max_retries) {
 				Sleep(attempt == 0 ? 0.0 : delay + Jitter());
 				delay = MinValue<double>(delay * 2, 8);
@@ -280,6 +301,7 @@ vector<vector<string>> JevCallAPI(const JevConfig &config, const JevQuestionSet 
 				throw IOException("jev: API error " + last_error);
 			}
 			stats.retries++;
+			retries++;
 			if (attempt + 1 < config.max_retries) {
 				auto retry_after = RetryAfterSeconds(response);
 				Sleep(MinValue<double>(retry_after >= 0 ? retry_after : delay, 30) + Jitter());
@@ -300,11 +322,15 @@ vector<vector<string>> JevCallAPI(const JevConfig &config, const JevQuestionSet 
 			stats.errors++;
 			throw IOException("jev: the API response has no answers object: %s", response->body.substr(0, 300));
 		}
-		vector<vector<string>> result(rows_json.size());
+		JevCallResult call;
+		call.retries = retries;
+		call.rate_limited_ms = rate_limited_ms;
+		auto &result = call.answers;
+		result.resize(rows_json.size());
 		for (idx_t i = 0; i < rows_json.size(); i++) {
 			result[i].reserve(set.questions.size());
 			for (idx_t q = 0; q < set.questions.size(); q++) {
-				auto answer = answers->find(AnswerKey(i, q));
+				auto answer = answers->find(AnswerKey(set, i, q));
 				if (answer == answers->end()) {
 					stats.errors++;
 					throw IOException("jev: the API answered %llu of %llu questions in this batch",
@@ -317,13 +343,15 @@ vector<vector<string>> JevCallAPI(const JevConfig &config, const JevQuestionSet 
 
 		auto usage = parsed.find("usage");
 		if (usage != parsed.end() && usage->is_object()) {
-			stats.input_tokens += usage->value("input_tokens", 0);
-			stats.output_tokens += usage->value("output_tokens", 0);
+			call.input_tokens = usage->value("input_tokens", 0);
+			call.output_tokens = usage->value("output_tokens", 0);
+			stats.input_tokens += call.input_tokens;
+			stats.output_tokens += call.output_tokens;
 		}
 		stats.requests++;
 		stats.rows_evaluated += rows_json.size();
 		stats.api_ms += static_cast<uint64_t>(elapsed.count());
-		return result;
+		return call;
 	}
 
 	stats.errors++;

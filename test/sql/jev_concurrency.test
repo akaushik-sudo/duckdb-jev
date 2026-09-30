@@ -1,0 +1,49 @@
+# name: test/sql/jev_concurrency.test
+# description: queries that meet the same uncached prompt at once send it once (single-flight)
+# group: [sql]
+
+#
+# Against the mock, with SNX_JEV_ENABLE_GENERIC=1 (for jev_stats). A row containing "slowmock"
+# makes the mock take 1.5 s, so the concurrent queries overlap.
+
+require snx_jev
+
+require json
+
+require-env JEV_MOCK_API_URL
+
+require-env SNX_JEV_API_URL
+
+statement ok
+SELECT jev_cache_clear();
+
+statement ok
+CREATE TABLE counters AS SELECT 0 AS phase, jev_stats() AS stats;
+
+concurrentloop i 0 4
+
+statement ok
+SELECT jev_prob(x, 'the text says hello') FROM (VALUES ('slowmock hello')) t(x);
+
+endloop
+
+statement ok
+INSERT INTO counters SELECT 1, jev_stats();
+
+# four queries, one request; the other three took its answer (or, if they started late, the cache)
+query II
+SELECT MAX(CASE WHEN phase = 1 THEN (stats->>'requests')::BIGINT END) -
+       MAX(CASE WHEN phase = 0 THEN (stats->>'requests')::BIGINT END),
+       (MAX(CASE WHEN phase = 1 THEN (stats->>'shared_in_flight')::BIGINT + (stats->>'cache_hits')::BIGINT END) -
+        MAX(CASE WHEN phase = 0 THEN (stats->>'shared_in_flight')::BIGINT + (stats->>'cache_hits')::BIGINT END))
+FROM counters;
+----
+1	3
+
+# and at least one of them really waited on the request in flight
+query I
+SELECT MAX(CASE WHEN phase = 1 THEN (stats->>'shared_in_flight')::BIGINT END) -
+       MAX(CASE WHEN phase = 0 THEN (stats->>'shared_in_flight')::BIGINT END) >= 1
+FROM counters;
+----
+true
