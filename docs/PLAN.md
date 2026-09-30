@@ -75,9 +75,21 @@ What landed:
   request body) closes a batch before `snx_jev_batch_size`; `snx_jev_max_value_chars` (2000 code points)
   cuts every string before it is sent, and before the cache key is taken.
 - Tests: `jev_ask.test` (78 assertions) against a mock that now rejects any malformed compact request.
-- **Still open: the live check.** The per-row wording ("Answer `rubric.q0` for the record `rows[3]`, using
-  its options.") is new and has not been run against the real API. Run the Phase 1 set through `jev_ask`
-  and compare labels and input tokens with §11 before P3 relies on it.
+- **Live check (2026-09-30, `jev-1.13.0`).** The Phase 1 set (50 hand-labelled prompts) went through
+  `jev_ask` with the §1 taxonomy, batch 32: 2 requests, 5,676 input tokens, ≈ $0.0002.
+
+  | | Phase 1 compact 32 | P2 `jev_ask` |
+  |---|---|---|
+  | Intent accuracy | 92% | 90% |
+  | Malicious caught / false alarms | 10/10, 0 | 10/10, 0 |
+  | Input tokens / prompt | 138 | 113.5 |
+
+  Four of the five intent misses are Phase 1's known case: the intent of a purely malicious prompt
+  reads `work_related`. The fifth is new (the pentest report template → `personal`, confidence 0.64).
+  **The malicious margin narrowed:** non-malicious ≤ 0.13 as before, but malicious ≥ 0.61 (Phase 1:
+  ≥ 0.92). The lowest is the one hidden inside a personal task. 0.5 still separates them. Suspect the
+  noul pointer wording ("satisfy the condition in `rubric.q1`?") when the condition is phrased as a
+  question. **P3:** tune the compiled wording for `snx_prompt_intent` and re-check with one 2-request run.
 
 ## P3 — `snx_prompt_intent(user_prompt)`, the only public function
 
