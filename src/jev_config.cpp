@@ -169,6 +169,11 @@ void JevConfig::RegisterSettings(DBConfig &config) {
 	    Value::UBIGINT(0));
 	add("snx_jev_cache_max_entries", "Answers kept in the process cache before the oldest are dropped",
 	    LogicalType::UBIGINT, Value::UBIGINT(200000));
+	add("snx_jev_max_value_chars", "Characters of each string in a row that are sent; the rest is cut. 0 = no limit",
+	    LogicalType::UBIGINT, Value::UBIGINT(2000));
+	add("snx_jev_max_batch_tokens",
+	    "Estimated input tokens at which a batch closes, even below snx_jev_batch_size (Jev allows 32k of state)",
+	    LogicalType::UBIGINT, Value::UBIGINT(24000));
 }
 
 static bool TryGet(ClientContext &context, const char *name, Value &result) {
@@ -213,6 +218,12 @@ JevConfig JevConfig::FromContext(ClientContext &context) {
 	}
 	if (TryGet(context, "snx_jev_cache_max_entries", value)) {
 		config.cache_max_entries = value.GetValue<uint64_t>();
+	}
+	if (TryGet(context, "snx_jev_max_value_chars", value)) {
+		config.max_value_chars = value.GetValue<uint64_t>();
+	}
+	if (TryGet(context, "snx_jev_max_batch_tokens", value)) {
+		config.max_batch_tokens = MaxValue<idx_t>(1, value.GetValue<uint64_t>());
 	}
 	return config;
 }

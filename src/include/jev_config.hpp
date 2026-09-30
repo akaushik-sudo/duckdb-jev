@@ -50,6 +50,11 @@ struct JevConfig {
 	idx_t max_rows_per_statement = 0;
 	idx_t max_chars_per_statement = 0;
 	idx_t cache_max_entries = 200000;
+	//! Every string in a row is cut to this many characters before it is sent (0 = no limit).
+	idx_t max_value_chars = 2000;
+	//! A batch closes before its estimated input tokens pass this, even under batch_size.
+	//! Jev allows 32k tokens of state (plus the longest question) and 64k per request.
+	idx_t max_batch_tokens = 24000;
 
 	//! Registers the settings on the database config. Called once, when the extension loads.
 	static void RegisterSettings(DBConfig &config);

@@ -50,6 +50,7 @@ case_ test/sql/jev_no_key.test JEV_ASSERT_NO_API_KEY=1 SNX_JEV_API_URL="$mock_ur
 
 # The judgment functions against the mock
 case_ test/sql/jev_api.test JEV_MOCK_API_URL="$mock_url" SNX_JEV_API_URL="$mock_url" TYPESAFE_API_KEY="$MOCK_KEY"
+case_ test/sql/jev_ask.test JEV_MOCK_API_URL="$mock_url" SNX_JEV_API_URL="$mock_url" TYPESAFE_API_KEY="$MOCK_KEY"
 case_ test/sql/jev_wrong_key.test JEV_ASSERT_WRONG_KEY=1 SNX_JEV_API_URL="$mock_url" TYPESAFE_API_KEY=not-the-key
 
 # A loopback port nothing listens on

@@ -50,7 +50,7 @@ for the design are in analytics-schema's prompt intent spec (`ollylake/prompt_in
   other process that runs untrusted SQL needs the same guard. Also process-wide and callable by
   any connection today: `jev_cache_clear()` and the `snx_jev_cache_max_entries` eviction (P3/P5).
 
-## P2 — What our questions need
+## P2 — What our questions need (done, pending the live check)
 
 - `choice` criteria carry descriptions (label → description), not bare labels.
 - Several questions per row share one request, so intent and malicious cost one call.
@@ -59,6 +59,25 @@ for the design are in analytics-schema's prompt intent spec (`ollylake/prompt_in
 - Return the choice's `probabilities`.
 - Close batches by estimated tokens as well as row count; truncate each prompt at 2,000 chars.
 - Done when: the mock tests pass, and a manual live check reproduces Phase 1 (≈138 input tokens per prompt).
+
+What landed:
+- **Compact layout for every request**: `state = {"rubric": {"q0": ...}, "rows": [...]}`, and one pointer
+  question per (row, question), keyed `r<row>_q<k>`. The single-question functions are a one-question
+  set on the same path, so upstream's per-row repetition of choice/score questions is gone for them too.
+- **Descriptions**: `jev_choice` / `jev_confidence` / `jev_eval` take options as a list or a
+  `MAP(label → description)` (one `ANY` signature, checked at bind, so an untyped NULL is not ambiguous).
+  `jev_ask` noul questions take `{"true": ..., "false": ...}` criteria. Descriptions are in the cache key.
+- **Several questions, one request**: `jev_ask(row, questions JSON) → JSON`, strict validation (types,
+  unknown fields, 1-255 options, 2-10 levels, ≤ 16 questions). One cache entry holds all of a row's answers.
+  P3's `snx_prompt_intent` is this path with the questions compiled in; `jev_ask` becomes opt-in there.
+- **Probabilities**: carried in `jev_eval` / `jev_ask` answers (`->'probabilities'`), for P3's struct.
+- **Bounded batches**: `snx_jev_max_batch_tokens` (24000, estimated at 3 bytes a token from the real
+  request body) closes a batch before `snx_jev_batch_size`; `snx_jev_max_value_chars` (2000 code points)
+  cuts every string before it is sent, and before the cache key is taken.
+- Tests: `jev_ask.test` (78 assertions) against a mock that now rejects any malformed compact request.
+- **Still open: the live check.** The per-row wording ("Answer `rubric.q0` for the record `rows[3]`, using
+  its options.") is new and has not been run against the real API. Run the Phase 1 set through `jev_ask`
+  and compare labels and input tokens with §11 before P3 relies on it.
 
 ## P3 — `snx_prompt_intent(user_prompt)`, the only public function
 

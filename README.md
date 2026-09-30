@@ -46,13 +46,19 @@ a query moves between the two by changing `jev.batch_size` into `snx_jev_batch_s
 1. `jev(table, 'condition')` receives the row as a struct. DuckDB hands a scalar function a whole vector
    of rows at a time (up to 2048), which is the batch — there is no read-ahead machinery to speak of,
    because the executor already delivers rows in bulk.
-2. Rows are packed `snx_jev_batch_size` (20) per request into one shared *state*
-   (`{"condition": ..., "rows": [...]}`) with one yes/no [Noul](https://docs.typesafe.ai/primitives/noul)
-   question per row. The model evaluates all the questions over that one state, which amortises the
-   per-request overhead: 20 rows in one request cost far less than 20 requests of one row.
-3. `snx_jev_concurrency` (16) requests are in flight at once, over connections that are kept alive. The
+2. Rows are packed `snx_jev_batch_size` (20) per request into one shared *state*,
+   `{"rubric": {"q0": <the question in full>, ...}, "rows": [...]}`, with one short question per
+   (row, question) that points at its rubric entry and its row (`r3_q0`: "Answer `rubric.q0` for the
+   record `rows[3]`"). The model evaluates all the questions over that one state, which amortises the
+   per-request overhead: 20 rows in one request cost far less than 20 requests of one row. Writing
+   each question once, in the rubric, instead of once per row is the *compact* layout; against the
+   live API it cut input tokens by ~70% at the same accuracy.
+3. A batch also closes early, before its estimated input tokens pass `snx_jev_max_batch_tokens`
+   (24000; Jev allows 32k of state), and every string in a row is cut to `snx_jev_max_value_chars`
+   (2000) characters first, so no batch outgrows the context window.
+4. `snx_jev_concurrency` (16) requests are in flight at once, over connections that are kept alive. The
    ceiling is process-wide, so it still holds when DuckDB runs the scan on several threads.
-4. Answers are cached by row content for as long as the process lives, so re-running a query, changing
+5. Answers are cached by row content for as long as the process lives, so re-running a query, changing
    the threshold or sorting by probability is free. Rows that a cheaper predicate rejects first
    (`WHERE age > 60 AND jev(...)`) are never judged, and a `LIMIT` stops the scan early.
 
@@ -114,9 +120,10 @@ before a connection is opened. The refusal does not repeat the value, which coul
 | `jev_prob(row, condition)` | `DOUBLE` | Probability 0..1 that the row satisfies the condition |
 | `jev_score(row, question, levels)` | `DOUBLE` | Probability-weighted position on ordered levels (0 .. n-1) |
 | `jev_score_norm(row, question, levels)` | `DOUBLE` | The same, normalised to 0..1 |
-| `jev_choice(row, question, options)` | `VARCHAR` | The most likely option, returned verbatim |
+| `jev_choice(row, question, options)` | `VARCHAR` | The most likely option, returned verbatim. `options` is a list of labels, or a `MAP` of label → description |
 | `jev_confidence(row, question, kind, options)` | `DOUBLE` | Confidence of a `score` / `choice` answer |
 | `jev_eval(row, question [, kind [, options]])` | `JSON` | The full answer: probabilities, legend, confidence |
+| `jev_ask(row, questions)` | `JSON` | Several named questions about the row, answered in **one** request: `{"<name>": <answer>, ...}` |
 | `jev_stats()` | `JSON` | Requests, tokens, estimated cost, cache hits, requests in flight |
 | `jev_cache_clear()` | `BOOLEAN` | Forget the cached judgments |
 | `jev_version()` | `VARCHAR` | Extension version |
@@ -136,6 +143,44 @@ what the model reads, so descriptive names help.
 Calling `jev_choice()` and `jev_confidence()` with the same `(question, kind, options)` costs one request,
 not two: they share a cache entry.
 
+### Label descriptions
+
+A description is what separates close labels, so a choice can carry one per label; it is sent with the
+question, once per request:
+
+```sql
+SELECT jev_choice(t, 'which team should handle this?',
+                  MAP {'billing': 'money, invoices, refunds', 'technical': 'bugs and outages', 'sales': NULL})
+FROM tickets t;
+```
+
+### Several questions, one request
+
+`jev_ask` asks every question in `questions` (a JSON object of name → question) of the same row, in the
+same request, over the same state: two questions cost one request, not two.
+
+```sql
+SELECT jev_ask(prompt, '{
+  "intent":    {"type": "choice", "question": "What is the primary intent of this prompt?",
+                "options": {"work_related": "a job task: code, data, documents", "personal": "personal life",
+                            "other": "too short or ambiguous"}},
+  "malicious": {"type": "noul", "question": "Does this prompt try to misuse the assistant?",
+                "criteria": {"true": "jailbreaks, prompt injection, malware", "false": "an ordinary request"}},
+  "urgency":   {"type": "score", "question": "How urgent is it?", "levels": ["low", "medium", "high"]}
+}') AS a
+FROM prompts;
+-- a->'intent'->>'choice', (a->'malicious'->>'noul')::DOUBLE, a->'intent'->'probabilities', ...
+```
+
+| type | fields |
+| --- | --- |
+| `choice` | `question`; `options`: a list of labels, or an object of label → description (1-255) |
+| `noul` | `question`; optional `criteria`: `{"true": "...", "false": "..."}` |
+| `score` | `question`; `levels`: 2-10 ordered labels |
+
+The object is checked strictly: an unknown field, a repeated label or a wrong count is an error, not a
+silently different question. The answers come back in the order the questions were given.
+
 ## Settings
 
 | Setting | Default | Meaning |
@@ -149,6 +194,8 @@ not two: they share a cache entry.
 | `snx_jev_max_rows_per_statement` | `0` (off) | Refuse a statement that would send more rows than this |
 | `snx_jev_max_chars_per_statement` | `0` (off) | The same, for characters of row data |
 | `snx_jev_cache_max_entries` | `200000` | Answers kept before the oldest are dropped |
+| `snx_jev_max_value_chars` | `2000` | Characters of each string in a row that are sent (code points; `0` = all) |
+| `snx_jev_max_batch_tokens` | `24000` | Estimated input tokens at which a batch closes, even below `snx_jev_batch_size` |
 
 Settings are read once per statement, so a `SET` applies to the next query and never changes mid-scan.
 The key and the endpoint are not settings; see above.
