@@ -7,7 +7,7 @@
 # from the environment. scripts/run_tests_with_mock.sh drops it and sets this flag;
 # a bare `make test` skips this file rather than spending a developer's key on it.
 
-require jev
+require snx_jev
 
 require-env JEV_ASSERT_NO_API_KEY
 

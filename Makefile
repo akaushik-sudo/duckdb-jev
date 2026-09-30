@@ -1,7 +1,7 @@
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 # Configuration of extension
-EXT_NAME=jev
+EXT_NAME=snx_jev
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 
 # The regression tests read answers back with the json functions

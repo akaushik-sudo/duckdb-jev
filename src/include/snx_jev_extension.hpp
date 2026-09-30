@@ -4,7 +4,7 @@
 
 namespace duckdb {
 
-class JevExtension : public Extension {
+class SnxJevExtension : public Extension {
 public:
 	void Load(ExtensionLoader &loader) override;
 	std::string Name() override;

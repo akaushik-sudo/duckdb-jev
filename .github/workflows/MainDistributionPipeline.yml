@@ -1,10 +1,15 @@
 #
-# Builds, tests and (on a tag) releases the extension binaries through DuckDB's
-# distribution pipeline.
+# Every push to main and every PR: build on linux_amd64 and run the suite against the mock API.
+# A tag (or a manual run): build the release binaries for the platforms we load them on.
+#
+# This repo is private, so Actions minutes are metered (macOS counts 10x). The full platform
+# matrix only runs when binaries are actually wanted.
 #
 name: Main Extension Distribution Pipeline
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -15,21 +20,26 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.4
     with:
-      duckdb_version: v1.5.5
-      ci_tools_version: v1.5-variegata
-      extension_name: jev
-      # jev talks HTTPS from a thread pool, neither of which a WASM build has.
-      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
+      # Must match the DuckDB the services load it into (analytics-schema pom.xml
+      # duckdb.jdbc.version): an extension only loads into the exact version it was built for.
+      duckdb_version: v1.5.4
+      ci_tools_version: v1.5.4
+      extension_name: snx_jev
+      # Built: linux_amd64, linux_arm64 (service images), osx_arm64, windows_amd64 (dev machines).
+      # WASM has neither HTTPS nor a thread pool, which snx_jev needs.
+      exclude_archs: 'osx_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
   code-quality-check:
     name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5-variegata
+    if: github.event_name == 'pull_request'
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5.4
     with:
-      duckdb_version: v1.5.5
-      ci_tools_version: v1.5-variegata
-      extension_name: jev
+      duckdb_version: v1.5.4
+      ci_tools_version: v1.5.4
+      extension_name: snx_jev
       format_checks: 'format'
 
   mock-api-tests:
@@ -41,11 +51,20 @@ jobs:
           submodules: recursive
 
       - name: Install build dependencies
-        run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build libssl-dev
+        run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build libssl-dev ccache
+
+      - name: ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-mock-v1.5.4-${{ github.sha }}
+          restore-keys: ccache-mock-v1.5.4-
 
       - name: Build
         env:
           GEN: ninja
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
         run: make release
 
       - name: Run the suite with the mock API
