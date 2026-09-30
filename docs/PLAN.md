@@ -173,7 +173,11 @@ the constraint, not parallelism. At 25 prompts a request and ~113 tokens a promp
 
 ## P4 — Distribution
 
-- Release binaries (tag → CI) for linux_amd64, linux_arm64, osx_arm64 and windows_amd64.
+- Release binaries for **linux_amd64 and linux_arm64 only** (decided 2026-09-30): search runs in a
+  Docker image (amd64 by default, arm64 via the Apple Silicon jib profile), so every Docker-based use is
+  covered. osx_arm64 / windows_amd64 (native laptop use of the generic functions) are deferred until
+  someone needs them; osx costs 10x Actions minutes on a private repo. Open: whether the cluster's
+  nodes are amd64 only.
 - Bake the binary into the search image and `LOAD` it by path. The fallback is a custom extension
   repository in MinIO. Either way it is unsigned, so the loader needs `allow_unsigned_extensions`.
 - Version rule: a DuckDB bump in analytics-schema (`duckdb.jdbc.version`) needs a matching
