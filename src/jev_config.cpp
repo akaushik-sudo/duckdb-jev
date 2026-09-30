@@ -121,7 +121,7 @@ static JevEnvironment ResolveEnvironment() {
 		if (text.size() > 7 || text.find_first_not_of("0123456789") != string::npos) {
 			// Refused like a bad endpoint, rather than silently running at some other rate.
 			environment.rate_refusal = "snx_jev: SNX_JEV_MAX_REQUESTS_PER_MINUTE must be a whole number of requests "
-			                           "a minute (0 = no limit)";
+			                           "a minute, 0 to 9999999 (0 = no limit)";
 		} else {
 			environment.max_requests_per_minute = std::stoull(text);
 		}
@@ -184,6 +184,9 @@ void JevConfig::RegisterSettings(DBConfig &config) {
 	    LogicalType::UBIGINT, Value::UBIGINT(200000));
 	add("snx_jev_max_value_chars", "Characters of each string in a row that are sent; the rest is cut. 0 = no limit",
 	    LogicalType::UBIGINT, Value::UBIGINT(2000));
+	add("snx_jev_max_wait_seconds",
+	    "Seconds a query waits for another query that is already sending the same row (1-86400)", LogicalType::UBIGINT,
+	    Value::UBIGINT(600));
 	add("snx_jev_max_batch_tokens",
 	    "Estimated input tokens at which a batch closes, even below snx_jev_batch_size (Jev allows 32k of state)",
 	    LogicalType::UBIGINT, Value::UBIGINT(24000));
@@ -231,6 +234,9 @@ JevConfig JevConfig::FromContext(ClientContext &context) {
 	}
 	if (TryGet(context, "snx_jev_max_value_chars", value)) {
 		config.max_value_chars = value.GetValue<uint64_t>();
+	}
+	if (TryGet(context, "snx_jev_max_wait_seconds", value)) {
+		config.max_wait_seconds = MinValue<idx_t>(86400, MaxValue<idx_t>(1, value.GetValue<uint64_t>()));
 	}
 	if (TryGet(context, "snx_jev_max_batch_tokens", value)) {
 		config.max_batch_tokens = MaxValue<idx_t>(1, value.GetValue<uint64_t>());

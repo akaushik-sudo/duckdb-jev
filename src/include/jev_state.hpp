@@ -28,6 +28,8 @@ struct JevStats {
 	std::atomic<uint64_t> in_flight {0};
 	//! Rows answered by another query's request for the same prompt that was already in flight
 	std::atomic<uint64_t> shared_in_flight {0};
+	//! Rows claimed and sent again after the query sending them failed
+	std::atomic<uint64_t> reclaimed {0};
 	//! Time requests spent waiting for the rate limiter
 	std::atomic<uint64_t> rate_limited_ms {0};
 };

@@ -219,17 +219,19 @@ JevRequestSize JevMeasureRequest(const JevConfig &config, const JevQuestionSet &
 
 idx_t JevEstimateTokens(const string &text) {
 	idx_t ascii_bytes = 0;
-	idx_t other_chars = 0;
+	idx_t two_byte_chars = 0;
+	idx_t wide_chars = 0;
 	for (auto c : text) {
 		auto byte = static_cast<unsigned char>(c);
 		if (byte < 0x80) {
 			ascii_bytes++;
-		} else if ((byte & 0xC0) != 0x80) {
-			// the first byte of a multi-byte character
-			other_chars++;
+		} else if ((byte & 0xE0) == 0xC0) {
+			two_byte_chars++; // accented Latin, Cyrillic, Greek, Hebrew, Arabic: about a token or less each
+		} else if ((byte & 0xF0) == 0xE0 || (byte & 0xF8) == 0xF0) {
+			wide_chars++; // CJK and other 3-byte scripts, emoji: up to about 2 tokens each
 		}
 	}
-	return (ascii_bytes + 2) / 3 + other_chars * 2;
+	return (ascii_bytes + 2) / 3 + two_byte_chars + wide_chars * 2;
 }
 
 static bool IsRetryable(int status) {

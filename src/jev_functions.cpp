@@ -90,10 +90,13 @@ static unique_ptr<FunctionData> JevBind(ClientContext &context, ScalarFunction &
 		// One signature for both forms, so an untyped NULL is not ambiguous between them:
 		// a list of labels, or a MAP of label -> description.
 		auto &type = arguments[OPTIONS_ARG]->return_type;
-		if (type.id() == LogicalTypeId::UNKNOWN || type.id() == LogicalTypeId::VARCHAR ||
-		    type.id() == LogicalTypeId::STRING_LITERAL) {
-			// A prepared-statement parameter, or a string such as '[a, b]': a list of labels, as
-			// before options took a MAP too. DuckDB casts to it.
+		bool constant_text = (type.id() == LogicalTypeId::VARCHAR || type.id() == LogicalTypeId::STRING_LITERAL) &&
+		                     arguments[OPTIONS_ARG]->IsFoldable();
+		if (type.id() == LogicalTypeId::UNKNOWN || constant_text) {
+			// A prepared-statement parameter, or a constant string such as '[a, b]': a list of
+			// labels, as before options took a MAP too; DuckDB casts to it. A parameter cannot also
+			// be a MAP, since its type is fixed when the statement is prepared: descriptions go in a
+			// MAP literal. A text *column* is refused below, at bind, not row by row.
 			bound_function.arguments[OPTIONS_ARG] = LogicalType::LIST(LogicalType::VARCHAR);
 			return std::move(data);
 		}
@@ -385,9 +388,6 @@ static void ParseQuestionSet(const string &text, JevQuestionSet &set, vector<str
 				}
 				question.descriptions = {yes->get<string>(), no->get<string>()};
 			}
-		} else {
-			throw InvalidInputException(
-			    "jev_ask: question '%s' has unknown type '%s'. Use 'noul', 'score' or 'choice'.", name, question.kind);
 		}
 		names.push_back(name);
 		set.questions.push_back(std::move(question));
@@ -715,19 +715,23 @@ struct JevWait {
 	JevGroup *group;
 };
 
-//! Waits for another query's answer. The wait can be cancelled (it checks the connection's
-//! interrupt flag every 100 ms), and gives up once the other query has had longer than all
-//! its attempts could take. Returns "" when that query failed.
+//! Waits for another query's answer. The wait can be cancelled (the connection's interrupt
+//! flag is checked before waiting and every 100 ms), and gives up after snx_jev_max_wait_seconds.
+//! That is its own setting, not derived from this query's timeout and retries: the other query
+//! completes its claims only once its whole chunk has been sent, rate-limited and all.
+//! Returns "" when that query failed.
 static string AwaitInFlight(ClientContext &context, const JevConfig &config, const std::shared_future<string> &answer) {
-	auto deadline = std::chrono::steady_clock::now() +
-	                std::chrono::milliseconds(static_cast<int64_t>((config.timeout + 30.0) * 1000.0) *
-	                                          static_cast<int64_t>(MaxValue<idx_t>(config.max_retries, 1)));
+	if (context.interrupted) {
+		throw InterruptException();
+	}
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(config.max_wait_seconds);
 	while (answer.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready) {
 		if (context.interrupted) {
 			throw InterruptException();
 		}
 		if (std::chrono::steady_clock::now() > deadline) {
-			throw IOException("jev: timed out waiting for another query that was sending the same row");
+			throw IOException("jev: waited snx_jev_max_wait_seconds = %llu for another query sending the same row",
+			                  static_cast<uint64_t>(config.max_wait_seconds));
 		}
 	}
 	return answer.get();
@@ -939,57 +943,77 @@ static void JevExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 	SendGroups(data, groups, claims, *query, answers, resolved);
 
 	// Pass 3: take the answers another query was sending. Our own claims are all complete by
-	// now, so two queries waiting on each other's keys cannot deadlock. When the other query
-	// failed (for its own reasons, perhaps: its row cap, a bad row of its own), claim the row
-	// and send it here, once.
-	std::unordered_map<string, unique_ptr<JevGroup>> retry_groups;
-	vector<JevWait> retry_waits;
-	auto take = [&](JevWait &wait, const string &encoded) {
-		session.stats.shared_in_flight += wait.targets.size();
-		query->current.shared_in_flight += wait.targets.size();
+	// now, so two queries waiting on each other's keys cannot deadlock.
+	auto take = [&](const JevWait &wait, const string &encoded, bool from_cache) {
+		if (from_cache) {
+			session.stats.cache_hits += wait.targets.size();
+			query->current.cache_hits += wait.targets.size();
+		} else {
+			session.stats.shared_in_flight += wait.targets.size();
+			query->current.shared_in_flight += wait.targets.size();
+		}
 		auto decoded = DecodeAnswers(encoded);
 		for (auto target : wait.targets) {
 			answers[target] = decoded;
 			resolved[target] = true;
 		}
 	};
+	vector<JevWait *> failed;
 	for (auto &wait : waits) {
 		auto encoded = AwaitInFlight(context, data.config, wait.answer);
-		if (!encoded.empty()) {
-			take(wait, encoded);
-			continue;
-		}
-		string cached;
-		std::shared_future<string> in_flight;
-		switch (session.LookupOrClaim(wait.key, cached, in_flight)) {
-		case JevClaim::HIT:
-			take(wait, cached);
-			break;
-		case JevClaim::WAIT:
-			wait.answer = std::move(in_flight);
-			retry_waits.push_back(std::move(wait));
-			break;
-		case JevClaim::CLAIMED: {
-			claims.Add(wait.key);
-			auto &source = *wait.group;
-			auto entry = retry_groups.find(source.set_key);
-			if (entry == retry_groups.end()) {
-				entry =
-				    retry_groups.insert(make_pair(source.set_key, MakeGroup(source.set, source.names, source.set_key)))
-				        .first;
-			}
-			AddClaimedRow(*entry->second, wait.key, wait.row_json, wait.targets);
-			break;
-		}
+		if (encoded.empty()) {
+			failed.push_back(&wait);
+		} else {
+			take(wait, encoded, false);
 		}
 	}
-	SendGroups(data, retry_groups, claims, *query, answers, resolved);
-	for (auto &wait : retry_waits) {
-		auto encoded = AwaitInFlight(context, data.config, wait.answer);
-		if (encoded.empty()) {
-			throw IOException("jev: two other queries sending the same row both failed; run this query again");
+
+	// Rows whose sender failed (for its own reasons, perhaps: its row cap, a bad row of its own):
+	// claim them and send them here. Every wait above is finished first, so a row claimed here is
+	// sent at once rather than held while this query waits on others. Other waiters go back
+	// through single-flight too, so one of them re-sends and the rest wait on it: a row goes out
+	// at most twice in all, and a second failure is that row's own.
+	if (!failed.empty()) {
+		if (context.interrupted) {
+			throw InterruptException();
 		}
-		take(wait, encoded);
+		std::unordered_map<string, unique_ptr<JevGroup>> retry_groups;
+		vector<JevWait> retry_waits;
+		for (auto *wait : failed) {
+			string cached;
+			std::shared_future<string> in_flight;
+			switch (session.LookupOrClaim(wait->key, cached, in_flight)) {
+			case JevClaim::HIT:
+				take(*wait, cached, true);
+				break;
+			case JevClaim::WAIT:
+				retry_waits.push_back(
+				    JevWait {std::move(in_flight), wait->targets, wait->key, wait->row_json, wait->group});
+				break;
+			case JevClaim::CLAIMED: {
+				claims.Add(wait->key);
+				session.stats.reclaimed++;
+				auto &source = *wait->group;
+				auto entry = retry_groups.find(source.set_key);
+				if (entry == retry_groups.end()) {
+					entry = retry_groups
+					            .insert(make_pair(source.set_key, MakeGroup(source.set, source.names, source.set_key)))
+					            .first;
+				}
+				AddClaimedRow(*entry->second, wait->key, wait->row_json, wait->targets);
+				break;
+			}
+			}
+		}
+		SendGroups(data, retry_groups, claims, *query, answers, resolved);
+		for (auto &wait : retry_waits) {
+			auto encoded = AwaitInFlight(context, data.config, wait.answer);
+			if (encoded.empty()) {
+				throw IOException("jev: this row failed twice, in two other queries' requests; it may be the row "
+				                  "itself the API rejects");
+			}
+			take(wait, encoded, false);
+		}
 	}
 
 	// Pass 4: pick the field this function returns out of each answer.
@@ -1038,6 +1062,7 @@ static void JevStatsFunction(DataChunk &args, ExpressionState &state, Vector &re
 	report["retries"] = stats.retries.load();
 	report["in_flight"] = stats.in_flight.load();
 	report["shared_in_flight"] = stats.shared_in_flight.load();
+	report["reclaimed"] = stats.reclaimed.load();
 	report["rate_limited_ms"] = stats.rate_limited_ms.load();
 	report["cached_answers"] = session.CachedAnswers();
 	// jev-1.13 list price; output tokens are free.

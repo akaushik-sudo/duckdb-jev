@@ -62,6 +62,8 @@ struct JevConfig {
 	//! A batch closes before its estimated input tokens pass this, even under batch_size.
 	//! Jev allows 32k tokens of state (plus the longest question) and 64k per request.
 	idx_t max_batch_tokens = 24000;
+	//! How long a query waits for another query that is sending the same row (1..86400 s).
+	idx_t max_wait_seconds = 600;
 
 	//! Registers the settings on the database config. Called once, when the extension loads.
 	static void RegisterSettings(DBConfig &config);

@@ -163,7 +163,7 @@ is always there.
 | `jev_prob(row, condition)` | `DOUBLE` | Probability 0..1 that the row satisfies the condition |
 | `jev_score(row, question, levels)` | `DOUBLE` | Probability-weighted position on ordered levels (0 .. n-1) |
 | `jev_score_norm(row, question, levels)` | `DOUBLE` | The same, normalised to 0..1 |
-| `jev_choice(row, question, options)` | `VARCHAR` | The most likely option, returned verbatim. `options` is a list of labels, or a `MAP` of label → description |
+| `jev_choice(row, question, options)` | `VARCHAR` | The most likely option, returned verbatim. `options` is a list of labels, or a `MAP` of label → description. A prepared-statement `?` takes a list only |
 | `jev_confidence(row, question, kind, options)` | `DOUBLE` | Confidence of a `score` / `choice` answer |
 | `jev_eval(row, question [, kind [, options]])` | `JSON` | The full answer: probabilities, legend, confidence |
 | `jev_ask(row, questions)` | `JSON` | Several named questions about the row, answered in **one** request: `{"<name>": <answer>, ...}` |
@@ -239,6 +239,7 @@ silently different question. The answers come back in the order the questions we
 | `snx_jev_cache_max_entries` | `200000` | Answers kept before the oldest are dropped |
 | `snx_jev_max_value_chars` | `2000` | Characters of each string in a row that are sent (code points; `0` = all) |
 | `snx_jev_max_batch_tokens` | `24000` | Estimated input tokens at which a batch closes, even below `snx_jev_batch_size` |
+| `snx_jev_max_wait_seconds` | `600` | How long a query waits for another query already sending the same row (1-86400) |
 
 Settings are read once per statement, so a `SET` applies to the next query and never changes mid-scan.
 The key and the endpoint are not settings; see above.

@@ -155,8 +155,9 @@ the constraint, not parallelism. At 25 prompts a request and ~113 tokens a promp
 - **Batch 25** is the default `snx_jev_batch_size` (upstream measured accuracy dropping above ~20-25).
 - **Parallel:** batches already go out on a process-wide pool (`snx_jev_concurrency`, 16), however many
   threads DuckDB scans with.
-- **Rate limiter:** a process-wide token bucket (`snx_jev_max_requests_per_minute`, default 1000, below
-  Jev's 1,200), so 16 parallel requests pace themselves instead of meeting 429s.
+- **Rate limiter:** a process-wide token bucket (`SNX_JEV_MAX_REQUESTS_PER_MINUTE` in the environment at
+  LOAD, default 1000, below Jev's 1,200; not a setting, since the bucket is shared), so 16 parallel
+  requests pace themselves instead of meeting 429s.
 - **Single-flight:** when two queries (or two scan threads) meet the same uncached prompt at once, one
   sends it and the other waits for that answer, instead of paying twice.
 - **Cap and estimate (search, P5):** at most **1,000 distinct prompts are sent per search**

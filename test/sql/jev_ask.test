@@ -281,6 +281,12 @@ EXECUTE pick(['billing', 'sales']);
 ----
 sales
 
+# a text column is not a list of labels: refused at bind, not row by row
+statement error
+SELECT jev_choice({'name': 'Ada'}, 'which team?', c) FROM (VALUES ('billing,sales')) t(c);
+----
+the options are a list of labels or a MAP
+
 #
 # Batches close by estimated tokens, not only by row count
 #
@@ -342,6 +348,14 @@ SELECT DISTINCT (jev_eval(repeat(c, 600), 'the text is long')->>'mock_batch_rows
 FROM (VALUES ('漢'), ('字'), ('語')) t(c);
 ----
 1
+
+# 2-byte scripts count about a token a character, not two: three 300-character Cyrillic rows
+# (~300 tokens each) share a request (at 2 a character they would not all fit)
+query I
+SELECT DISTINCT (jev_eval(repeat(c, 300), 'the text is long')->>'mock_batch_rows')::INTEGER
+FROM (VALUES ('д'), ('ж'), ('ы')) t(c);
+----
+3
 
 statement ok
 RESET snx_jev_max_batch_tokens;

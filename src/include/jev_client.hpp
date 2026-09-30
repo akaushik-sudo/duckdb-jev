@@ -66,9 +66,10 @@ struct JevRequestSize {
 };
 JevRequestSize JevMeasureRequest(const JevConfig &config, const JevQuestionSet &set);
 
-//! Conservative token estimate for request text. ASCII runs ~4 bytes a token; this counts 3.
-//! Anything else (CJK, emoji, accented text) is counted per character, at 2 tokens each,
-//! because a byte count badly undercounts it: a 3-byte CJK character is often a whole token.
+//! Conservative token estimate for request text, by UTF-8 sequence length. ASCII runs ~4 bytes
+//! a token; this counts 3. A 2-byte character (accented Latin, Cyrillic, Greek, ...) counts 1,
+//! and a 3- or 4-byte one (CJK, emoji) counts 2: a byte count badly undercounts those, a flat
+//! per-character count badly overcounts the 2-byte scripts.
 idx_t JevEstimateTokens(const string &text);
 
 } // namespace duckdb
