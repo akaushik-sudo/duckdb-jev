@@ -15,14 +15,28 @@ for the design are in analytics-schema's prompt intent spec (`ollylake/prompt_in
 - CI: the mock suite runs on PRs and main; the platform builds run on a `v*` tag or a manual dispatch.
 - Verified: `make test_mock` passes, and the loadable binary loads into a stock duckdb 1.5.4.
 
-## P1 — Harden
+## P1 — Harden (done)
 
-- The API host is fixed when the extension loads, and nothing in SQL can change it. The mock URL
-  is accepted only through an env var, for tests.
-- The key comes only from `TYPESAFE_API_KEY` (or a DuckDB secret). There is no `jev_api_key`
-  setting, so no query can read the key back through `current_setting()` / `duckdb_settings()`.
-- `customer_id` goes into the cache key (argument or setting — decide in the PR).
-- Tests: a `SET` of the URL fails, the key cannot be read back, and a planted host is refused.
+- **Endpoint:** fixed once per process, at LOAD. The default is `https://api.typesafe.ai/v1/systemone`.
+  `SNX_JEV_API_URL` may replace it only with loopback (`localhost` / `127.0.0.1` / `[::1]`, numeric
+  port). Anything else, including userinfo (`@`), backslash, whitespace, lookalike hosts and other
+  schemes, is recorded as a refusal, and every request fails with it before a connection opens.
+  The `jev_api_url` setting is gone.
+- **Key:** only from `TYPESAFE_API_KEY`, and the `jev_api_key` setting is gone, so
+  `current_setting()` / `duckdb_settings()` have nothing to show. The JDBC and Python clients have no
+  SQL `getenv()`; only the CLI shell does. A DuckDB secret was not added: the environment is what
+  search's deployment already uses.
+- **Cache:** namespaced by the connection's `scope_customer_id` variable, which search already pins
+  from the verified token (`ClassicSearchEngineV2.pinCustomerScope`). No argument was needed, so
+  P3 stays single-argument. An unset variable is a namespace of its own.
+- The remaining settings are renamed `jev_*` → `snx_jev_*`: upstream's `RegisterSettings` silently
+  skips a name that is already registered, so a community `jev` loaded first would have owned ours.
+- User-Agent is `snx-jev/<version>`.
+- Tests: one `unittest` process per environment (`scripts/run_tests_with_mock.sh`): offline, no key,
+  mock, wrong key, unreachable, and ten hostile URLs. Several of those would reach the running mock
+  if let through; a negative control, the same test run with the real mock URL, fails as it should.
+- Still global, on purpose until P3 removes them from the search path: `jev_stats()` counters and
+  the `snx_jev_*` settings. P5 freezes the settings with `lock_configuration = true`.
 
 ## P2 — What our questions need
 

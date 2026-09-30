@@ -31,7 +31,7 @@ string JevQuestion::CacheKey() const {
 static void SplitURL(const string &url, string &origin, string &path) {
 	auto scheme_end = url.find("://");
 	if (scheme_end == string::npos) {
-		throw InvalidInputException("jev: jev_api_url must start with http:// or https:// (got '%s')", url);
+		throw InvalidInputException("snx_jev: the API URL must start with http:// or https:// (got '%s')", url);
 	}
 	auto path_start = url.find('/', scheme_end + 3);
 	if (path_start == string::npos) {
@@ -161,12 +161,12 @@ static double Jitter() {
 }
 
 vector<string> JevCallAPI(const JevConfig &config, const JevQuestion &question, const vector<string> &rows_json) {
-	config.RequireAPIKey();
+	config.RequireSendable();
 
 	string origin, path;
 	SplitURL(config.api_url, origin, path);
 	auto body = BuildRequestBody(config, question, rows_json);
-	http::Headers headers = {{"Authorization", "Bearer " + config.api_key}, {"User-Agent", "duckdb-jev/" JEV_VERSION}};
+	http::Headers headers = {{"Authorization", "Bearer " + config.api_key}, {"User-Agent", "snx-jev/" JEV_VERSION}};
 
 	auto &stats = JevState::Get().stats;
 	string last_error = "no attempt was made";

@@ -13,6 +13,9 @@ namespace duckdb {
 
 static void LoadInternal(ExtensionLoader &loader) {
 	loader.SetDescription("Ask your DuckDB tables questions in plain language");
+	// Fix the endpoint now, from the environment the process started with. A refused one
+	// does not fail the LOAD; every request fails with the refusal instead.
+	JevEndpoint::Get();
 	JevConfig::RegisterSettings(DBConfig::GetConfig(loader.GetDatabaseInstance()));
 	JevRegisterFunctions(loader);
 }

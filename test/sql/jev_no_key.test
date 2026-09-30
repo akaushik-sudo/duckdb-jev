@@ -3,16 +3,13 @@
 # group: [sql]
 
 #
-# Split out of jev_offline.test because it only holds when TYPESAFE_API_KEY is absent
-# from the environment. scripts/run_tests_with_mock.sh drops it and sets this flag;
-# a bare `make test` skips this file rather than spending a developer's key on it.
+# Only holds when TYPESAFE_API_KEY is absent from the environment, which is the only place a
+# key can come from. scripts/run_tests_with_mock.sh runs it that way and sets this flag; a bare
+# `make test` skips this file rather than spending a developer's key on it.
 
 require snx_jev
 
 require-env JEV_ASSERT_NO_API_KEY
-
-statement ok
-SET jev_api_key = '';
 
 statement error
 SELECT jev({'name': 'Ada'}, 'the name is European');

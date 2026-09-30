@@ -6,13 +6,9 @@ require snx_jev
 
 require json
 
+# scripts/run_tests_with_mock.sh starts the extension with SNX_JEV_API_URL pointing at the
+# mock and TYPESAFE_API_KEY set to the mock's key; SQL can set neither.
 require-env JEV_MOCK_API_URL
-
-statement ok
-SET jev_api_url = '${JEV_MOCK_API_URL}';
-
-statement ok
-SET jev_api_key = 'jev-test-key';
 
 statement ok
 CREATE TABLE people (id INTEGER, name VARCHAR, note VARCHAR);
@@ -44,7 +40,7 @@ SELECT count(*) FROM people WHERE jev(people, 'the person writes compilers', 0.9
 0
 
 statement ok
-SET jev_threshold = 0.05;
+SET snx_jev_threshold = 0.05;
 
 query I
 SELECT count(*) FROM people WHERE jev(people, 'the person writes compilers');
@@ -52,7 +48,7 @@ SELECT count(*) FROM people WHERE jev(people, 'the person writes compilers');
 3
 
 statement ok
-RESET jev_threshold;
+RESET snx_jev_threshold;
 
 # An alias works the same way, and so does a subset of the columns
 query I
@@ -146,12 +142,12 @@ FROM counters;
 ----
 3
 
-# jev_batch_size decides how many rows share a request
+# snx_jev_batch_size decides how many rows share a request
 statement ok
 SELECT jev_cache_clear();
 
 statement ok
-SET jev_batch_size = 1;
+SET snx_jev_batch_size = 1;
 
 statement ok
 DELETE FROM counters;
@@ -173,7 +169,7 @@ FROM counters;
 3
 
 statement ok
-SET jev_batch_size = 20;
+SET snx_jev_batch_size = 20;
 
 statement ok
 SELECT jev_cache_clear();
@@ -236,7 +232,7 @@ FROM counters;
 1
 
 statement ok
-SET jev_max_retries = 2;
+SET snx_jev_max_retries = 2;
 
 statement error
 SELECT jev(people, 'this one says trigger503') FROM people;
@@ -244,20 +240,63 @@ SELECT jev(people, 'this one says trigger503') FROM people;
 unreachable after
 
 statement ok
-RESET jev_max_retries;
+RESET snx_jev_max_retries;
 
-# A wrong key is the endpoint's answer, not a wrong row. The cache has to go first,
-# or the rows would be answered without anyone checking the key.
+# The cache is split by the connection's scope_customer_id (set by the search service from
+# the verified token): one customer's answers are never another customer's cache hit.
 statement ok
 SELECT jev_cache_clear();
 
 statement ok
-SET jev_api_key = 'not-the-key';
-
-statement error
-SELECT jev(people, 'the person writes compilers') FROM people;
-----
-API error 401
+SET VARIABLE scope_customer_id = 101;
 
 statement ok
-SET jev_api_key = 'jev-test-key';
+DELETE FROM counters;
+
+statement ok
+INSERT INTO counters SELECT 0, jev_stats();
+
+statement ok
+SELECT jev_prob(people, 'the person writes poetry') FROM people;
+
+statement ok
+INSERT INTO counters SELECT 1, jev_stats();
+
+# the same customer again: all three from cache
+statement ok
+SELECT jev_prob(people, 'the person writes poetry') FROM people;
+
+statement ok
+INSERT INTO counters SELECT 2, jev_stats();
+
+statement ok
+SET VARIABLE scope_customer_id = 202;
+
+# another customer, the same rows and question: asked again, not answered from 101's cache
+statement ok
+SELECT jev_prob(people, 'the person writes poetry') FROM people;
+
+statement ok
+INSERT INTO counters SELECT 3, jev_stats();
+
+statement ok
+RESET VARIABLE scope_customer_id;
+
+# no scope at all (a hand-run session) is a namespace of its own
+statement ok
+SELECT jev_prob(people, 'the person writes poetry') FROM people;
+
+statement ok
+INSERT INTO counters SELECT 4, jev_stats();
+
+query IIII
+SELECT d1, d2, d3, d4 FROM (
+  SELECT
+    MAX(CASE WHEN phase = 1 THEN r END) - MAX(CASE WHEN phase = 0 THEN r END) AS d1,
+    MAX(CASE WHEN phase = 2 THEN r END) - MAX(CASE WHEN phase = 1 THEN r END) AS d2,
+    MAX(CASE WHEN phase = 3 THEN r END) - MAX(CASE WHEN phase = 2 THEN r END) AS d3,
+    MAX(CASE WHEN phase = 4 THEN r END) - MAX(CASE WHEN phase = 3 THEN r END) AS d4
+  FROM (SELECT phase, json_extract_string(stats, '$.rows_evaluated')::BIGINT AS r FROM counters)
+);
+----
+3	0	3	3

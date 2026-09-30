@@ -1,0 +1,16 @@
+# name: test/sql/jev_wrong_key.test
+# description: a key the endpoint rejects is the endpoint's answer, not a wrong row
+# group: [sql]
+
+#
+# Run by scripts/run_tests_with_mock.sh against the mock with TYPESAFE_API_KEY set to a key the
+# mock does not accept.
+
+require snx_jev
+
+require-env JEV_ASSERT_WRONG_KEY
+
+statement error
+SELECT jev(people, 'the person writes compilers') FROM (VALUES ('Ada')) people(name);
+----
+API error 401
