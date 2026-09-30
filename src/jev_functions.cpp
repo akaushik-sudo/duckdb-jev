@@ -17,7 +17,7 @@ namespace duckdb {
 using nlohmann::ordered_json;
 
 //! Which field of the answer the caller wants.
-enum class JevResult : uint8_t { PREDICATE, PROBABILITY, SCORE, SCORE_NORM, CHOICE, CONFIDENCE, EVAL };
+enum class JevResult : uint8_t { PREDICATE, PROBABILITY, SCORE, SCORE_NORM, CHOICE, CONFIDENCE, EVAL, ASK };
 //! Where the question kind comes from: the function itself, or one of its arguments.
 enum class JevKindSource : uint8_t { NOUL, SCORE, CHOICE, FROM_ARGUMENT };
 
@@ -74,6 +74,17 @@ static unique_ptr<FunctionData> JevBind(ClientContext &context, ScalarFunction &
 		// `jev(NULL, ...)`: nothing to judge, but the plan still needs a type.
 		bound_function.arguments[0] = LogicalType::SQLNULL;
 	}
+	if (OPTIONS_ARG != NO_ARG && bound_function.arguments[OPTIONS_ARG].id() == LogicalTypeId::ANY) {
+		// One signature for both forms, so an untyped NULL is not ambiguous between them:
+		// a list of labels, or a MAP of label -> description.
+		auto &type = arguments[OPTIONS_ARG]->return_type;
+		if (type.id() != LogicalTypeId::LIST && type.id() != LogicalTypeId::MAP &&
+		    type.id() != LogicalTypeId::SQLNULL) {
+			throw BinderException("%s: the options are a list of labels or a MAP of label -> description, not %s",
+			                      bound_function.name, type.ToString());
+		}
+		bound_function.arguments[OPTIONS_ARG] = type;
+	}
 	return std::move(data);
 }
 
@@ -81,14 +92,17 @@ static unique_ptr<FunctionData> JevBind(ClientContext &context, ScalarFunction &
 // Execute
 //===--------------------------------------------------------------------===//
 
-//! Rows judged together: one question, the distinct row payloads under it, and where
-//! each answer has to be written back to.
+//! Rows judged together: one question set, the distinct row payloads under it, and where
+//! each row's answers have to be written back to.
 struct JevGroup {
-	JevQuestion question;
+	JevQuestionSet set;
+	//! jev_ask only: the name each question's answer goes under, parallel to set.questions
+	vector<string> names;
 	vector<string> rows;
 	vector<string> cache_keys;
 	vector<vector<idx_t>> targets;
-	vector<string> answers;
+	//! answers[slot][question]; empty for a slot whose batch failed
+	vector<vector<string>> answers;
 	std::unordered_map<string, idx_t> row_index;
 };
 
@@ -108,6 +122,27 @@ struct JevBatch {
 static string CacheEntryKey(const string &scope, const string &question_key, const string &row_json) {
 	return scope + "\x1f" + to_string(Hash(question_key.c_str(), question_key.size())) + ":" +
 	       to_string(Hash(row_json.c_str(), row_json.size())) + ":" + to_string(row_json.size());
+}
+
+//! A row's answers, one per question, as one cache value (a JSON array).
+static string EncodeAnswers(const vector<string> &answers) {
+	string out = "[";
+	for (idx_t i = 0; i < answers.size(); i++) {
+		if (i > 0) {
+			out += ',';
+		}
+		out += answers[i];
+	}
+	out += ']';
+	return out;
+}
+
+static vector<string> DecodeAnswers(const string &encoded) {
+	vector<string> answers;
+	for (auto &answer : ordered_json::parse(encoded)) {
+		answers.push_back(answer.dump());
+	}
+	return answers;
 }
 
 //! Returns false when the kind argument is NULL, which makes the answer NULL - the
@@ -138,9 +173,13 @@ static bool ResolveKind(const JevBindData &data, DataChunk &args, idx_t row, str
 
 //! Returns false when the options argument is NULL: a NULL answer, not an error. An
 //! empty list is an error, because it is a question nobody can answer.
-static bool ResolveOptions(const JevBindData &data, DataChunk &args, idx_t row, const string &kind,
-                           vector<string> &options) {
-	options.clear();
+//!
+//! Options are either a list of labels, or a MAP of label -> description; the
+//! description is what separates close labels, and it is sent with the question.
+static bool ResolveOptions(const JevBindData &data, DataChunk &args, idx_t row, JevQuestion &question) {
+	question.options.clear();
+	question.descriptions.clear();
+	auto &kind = question.kind;
 	if (kind == "noul") {
 		return true;
 	}
@@ -153,16 +192,164 @@ static bool ResolveOptions(const JevBindData &data, DataChunk &args, idx_t row, 
 	if (value.IsNull()) {
 		return false;
 	}
-	for (auto &child : ListValue::GetChildren(value)) {
-		if (child.IsNull()) {
-			throw InvalidInputException("jev: the options of a '%s' question cannot contain NULL.", kind);
+	if (value.type().id() == LogicalTypeId::MAP) {
+		if (kind != "choice") {
+			throw InvalidInputException("jev: only a 'choice' question takes label descriptions; give a '%s' "
+			                            "question a list of levels.",
+			                            kind);
 		}
-		options.push_back(child.ToString());
+		for (auto &entry : MapValue::GetChildren(value)) {
+			auto &pair = StructValue::GetChildren(entry);
+			if (pair[0].IsNull()) {
+				throw InvalidInputException("jev: the options of a '%s' question cannot contain NULL.", kind);
+			}
+			question.options.push_back(pair[0].ToString());
+			question.descriptions.push_back(pair[1].IsNull() ? string() : pair[1].ToString());
+		}
+	} else {
+		for (auto &child : ListValue::GetChildren(value)) {
+			if (child.IsNull()) {
+				throw InvalidInputException("jev: the options of a '%s' question cannot contain NULL.", kind);
+			}
+			question.options.push_back(child.ToString());
+		}
 	}
-	if (options.empty()) {
+	if (question.options.empty()) {
 		throw InvalidInputException("jev: a '%s' question needs at least one option.", kind);
 	}
 	return true;
+}
+
+//! Limits the API sets on a question (and a sanity bound on how many ride in one request).
+static constexpr idx_t MAX_ASK_QUESTIONS = 16;
+static constexpr idx_t MAX_CHOICE_OPTIONS = 255;
+static constexpr idx_t MIN_SCORE_LEVELS = 2;
+static constexpr idx_t MAX_SCORE_LEVELS = 10;
+
+static string RequireText(const ordered_json &object, const char *field, const string &name) {
+	auto entry = object.find(field);
+	if (entry == object.end() || !entry->is_string() || entry->get<string>().empty()) {
+		throw InvalidInputException("jev_ask: question '%s' needs a non-empty string \"%s\".", name, field);
+	}
+	return entry->get<string>();
+}
+
+//! The questions argument of jev_ask, e.g.
+//!   {"intent":    {"type": "choice", "question": "...", "options": {"work": "...", "personal": "..."}},
+//!    "malicious": {"type": "noul",   "question": "...", "criteria": {"true": "...", "false": "..."}},
+//!    "urgency":   {"type": "score",  "question": "...", "levels": ["low", "medium", "high"]}}
+//! Strict: unknown fields are errors, so a typo cannot silently drop a description.
+static void ParseQuestionSet(const string &text, JevQuestionSet &set, vector<string> &names) {
+	ordered_json parsed;
+	try {
+		parsed = ordered_json::parse(text);
+	} catch (std::exception &error) {
+		throw InvalidInputException("jev_ask: the questions are not valid JSON: %s", error.what());
+	}
+	if (!parsed.is_object() || parsed.empty()) {
+		throw InvalidInputException("jev_ask: the questions must be a non-empty JSON object of name -> question.");
+	}
+	if (parsed.size() > MAX_ASK_QUESTIONS) {
+		throw InvalidInputException("jev_ask: at most %llu questions per call.",
+		                            static_cast<uint64_t>(MAX_ASK_QUESTIONS));
+	}
+	for (auto &item : parsed.items()) {
+		auto &name = item.key();
+		auto &spec = item.value();
+		if (name.empty()) {
+			throw InvalidInputException("jev_ask: a question name cannot be empty.");
+		}
+		if (!spec.is_object()) {
+			throw InvalidInputException("jev_ask: question '%s' must be an object.", name);
+		}
+		JevQuestion question;
+		question.kind = RequireText(spec, "type", name);
+		question.query = RequireText(spec, "question", name);
+
+		for (auto &field : spec.items()) {
+			auto &key = field.key();
+			bool known = key == "type" || key == "question" || (question.kind == "choice" && key == "options") ||
+			             (question.kind == "score" && key == "levels") ||
+			             (question.kind == "noul" && key == "criteria");
+			if (!known) {
+				throw InvalidInputException("jev_ask: question '%s' (%s) has an unexpected field \"%s\".", name,
+				                            question.kind, key);
+			}
+		}
+
+		if (question.kind == "choice") {
+			auto options = spec.find("options");
+			if (options == spec.end()) {
+				throw InvalidInputException("jev_ask: choice question '%s' needs \"options\".", name);
+			}
+			if (options->is_array()) {
+				for (auto &label : *options) {
+					if (!label.is_string() || label.get<string>().empty()) {
+						throw InvalidInputException("jev_ask: the options of '%s' must be non-empty strings.", name);
+					}
+					question.options.push_back(label.get<string>());
+				}
+			} else if (options->is_object()) {
+				for (auto &label : options->items()) {
+					if (label.key().empty() || !(label.value().is_string() || label.value().is_null())) {
+						throw InvalidInputException(
+						    "jev_ask: the options of '%s' map non-empty labels to a description string or null.", name);
+					}
+					question.options.push_back(label.key());
+					question.descriptions.push_back(label.value().is_string() ? label.value().get<string>() : string());
+				}
+			} else {
+				throw InvalidInputException(
+				    "jev_ask: the options of '%s' are a list of labels or an object of label -> description.", name);
+			}
+			if (question.options.empty() || question.options.size() > MAX_CHOICE_OPTIONS) {
+				throw InvalidInputException("jev_ask: choice question '%s' needs 1 to %llu options.", name,
+				                            static_cast<uint64_t>(MAX_CHOICE_OPTIONS));
+			}
+			for (idx_t i = 0; i < question.options.size(); i++) {
+				for (idx_t j = 0; j < i; j++) {
+					if (question.options[i] == question.options[j]) {
+						throw InvalidInputException("jev_ask: choice question '%s' repeats the option '%s'.", name,
+						                            question.options[i]);
+					}
+				}
+			}
+		} else if (question.kind == "score") {
+			auto levels = spec.find("levels");
+			if (levels == spec.end() || !levels->is_array()) {
+				throw InvalidInputException("jev_ask: score question '%s' needs \"levels\", a list.", name);
+			}
+			for (auto &level : *levels) {
+				if (!level.is_string() || level.get<string>().empty()) {
+					throw InvalidInputException("jev_ask: the levels of '%s' must be non-empty strings.", name);
+				}
+				question.options.push_back(level.get<string>());
+			}
+			if (question.options.size() < MIN_SCORE_LEVELS || question.options.size() > MAX_SCORE_LEVELS) {
+				throw InvalidInputException("jev_ask: score question '%s' needs %llu to %llu levels.", name,
+				                            static_cast<uint64_t>(MIN_SCORE_LEVELS),
+				                            static_cast<uint64_t>(MAX_SCORE_LEVELS));
+			}
+		} else if (question.kind == "noul") {
+			auto criteria = spec.find("criteria");
+			if (criteria != spec.end()) {
+				auto yes = criteria->is_object() ? criteria->find("true") : criteria->end();
+				auto no = criteria->is_object() ? criteria->find("false") : criteria->end();
+				if (!criteria->is_object() || criteria->size() != 2 || yes == criteria->end() ||
+				    no == criteria->end() || !yes->is_string() || !no->is_string()) {
+					throw InvalidInputException(
+					    "jev_ask: the criteria of noul question '%s' are {\"true\": \"...\", \"false\": \"...\"}.",
+					    name);
+				}
+				question.descriptions = {yes->get<string>(), no->get<string>()};
+			}
+		} else {
+			throw InvalidInputException(
+			    "jev_ask: question '%s' has unknown type '%s'. Use 'noul', 'score' or 'choice'.", name, question.kind);
+		}
+		names.push_back(name);
+		set.questions.push_back(std::move(question));
+	}
 }
 
 //! Refuses to send anything once this statement has spent its budget.
@@ -202,7 +389,7 @@ static std::exception_ptr RunBatches(const JevBindData &data, vector<JevBatch> &
 			                    group.rows.begin() + batch_ptr->start + batch_ptr->count);
 			state.stats.in_flight++;
 			try {
-				auto answers = JevCallAPI(*config, group.question, rows);
+				auto answers = JevCallAPI(*config, group.set, rows);
 				for (idx_t i = 0; i < answers.size(); i++) {
 					group.answers[batch_ptr->start + i] = std::move(answers[i]);
 				}
@@ -227,9 +414,50 @@ static std::exception_ptr RunBatches(const JevBindData &data, vector<JevBatch> &
 	return first_error;
 }
 
-static void WriteAnswer(const JevBindData &data, Vector &result, idx_t row, const string &answer_json, double threshold,
-                        idx_t level_count) {
+//! Slices each group into requests: a batch closes at snx_jev_batch_size rows, or before
+//! its estimated input tokens would pass snx_jev_max_batch_tokens, whichever comes first.
+//! A single row over the budget still goes out, alone.
+static void PlanBatches(const JevConfig &config, JevGroup &group, vector<JevBatch> &batches) {
+	auto size = JevMeasureRequest(config, group.set);
+	auto fixed_tokens = JevEstimateTokens(size.fixed_bytes);
+	idx_t start = 0;
+	idx_t count = 0;
+	idx_t tokens = fixed_tokens;
+	for (idx_t slot = 0; slot < group.rows.size(); slot++) {
+		auto row_tokens = JevEstimateTokens(group.rows[slot].size() + size.per_row_bytes);
+		if (count > 0 && (count == config.batch_size || tokens + row_tokens > config.max_batch_tokens)) {
+			batches.push_back(JevBatch {&group, start, count});
+			start = slot;
+			count = 0;
+			tokens = fixed_tokens;
+		}
+		count++;
+		tokens += row_tokens;
+	}
+	if (count > 0) {
+		batches.push_back(JevBatch {&group, start, count});
+	}
+}
+
+static void WriteAnswer(const JevBindData &data, Vector &result, idx_t row, const vector<string> &answers,
+                        const vector<string> &names, double threshold, idx_t level_count) {
 	auto &validity = FlatVector::Validity(result);
+	if (data.result == JevResult::ASK) {
+		// {"<name>": <answer>, ...}, in the order the questions were given
+		string out = "{";
+		for (idx_t q = 0; q < answers.size(); q++) {
+			if (q > 0) {
+				out += ',';
+			}
+			JevWriteJSONString(names[q], out);
+			out += ':';
+			out += answers[q];
+		}
+		out += '}';
+		FlatVector::GetData<string_t>(result)[row] = StringVector::AddString(result, out);
+		return;
+	}
+	auto &answer_json = answers[0];
 	if (data.result == JevResult::EVAL) {
 		FlatVector::GetData<string_t>(result)[row] = StringVector::AddString(result, answer_json);
 		return;
@@ -312,11 +540,14 @@ static void JevExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &validity = FlatVector::Validity(result);
 
-	vector<string> answers(count);
+	vector<vector<string>> answers(count);
 	vector<bool> resolved(count, false);
+	vector<JevGroup *> row_groups(count, nullptr);
 	vector<double> thresholds(count, data.config.threshold);
 	vector<idx_t> level_counts(count, 1);
 	std::unordered_map<string, unique_ptr<JevGroup>> groups;
+	// jev_ask: each distinct questions text is parsed once per chunk
+	std::unordered_map<string, JevGroup *> parsed_sets;
 
 	// Pass 1: serialise every row, answer what the cache already knows and group the rest.
 	for (idx_t i = 0; i < count; i++) {
@@ -333,46 +564,71 @@ static void JevExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 			}
 		}
 
-		JevQuestion question;
-		if (!ResolveKind(data, args, i, question.kind) ||
-		    !ResolveOptions(data, args, i, question.kind, question.options)) {
-			validity.SetInvalid(i);
-			continue;
+		JevGroup *group = nullptr;
+		if (data.result == JevResult::ASK) {
+			auto text = query_value.ToString();
+			auto known = parsed_sets.find(text);
+			if (known != parsed_sets.end()) {
+				group = known->second;
+			} else {
+				JevQuestionSet set;
+				vector<string> names;
+				ParseQuestionSet(text, set, names);
+				auto set_key = set.CacheKey();
+				auto entry = groups.find(set_key);
+				if (entry == groups.end()) {
+					auto fresh = make_uniq<JevGroup>();
+					fresh->set = std::move(set);
+					fresh->names = std::move(names);
+					entry = groups.insert(make_pair(set_key, std::move(fresh))).first;
+				}
+				group = entry->second.get();
+				parsed_sets.insert(make_pair(text, group));
+			}
+		} else {
+			JevQuestion question;
+			if (!ResolveKind(data, args, i, question.kind) || !ResolveOptions(data, args, i, question)) {
+				validity.SetInvalid(i);
+				continue;
+			}
+			question.query = query_value.ToString();
+			level_counts[i] = MaxValue<idx_t>(question.options.size(), 1);
+			JevQuestionSet set;
+			set.questions.push_back(std::move(question));
+			auto set_key = set.CacheKey();
+			auto entry = groups.find(set_key);
+			if (entry == groups.end()) {
+				auto fresh = make_uniq<JevGroup>();
+				fresh->set = std::move(set);
+				entry = groups.insert(make_pair(set_key, std::move(fresh))).first;
+			}
+			group = entry->second.get();
 		}
-		question.query = query_value.ToString();
-		level_counts[i] = MaxValue<idx_t>(question.options.size(), 1);
+		row_groups[i] = group;
 
-		auto row_json = JevValueToJSON(row_value);
-		auto question_key = question.CacheKey();
-		auto entry_key = CacheEntryKey(data.config.cache_scope, question_key, row_json);
+		auto row_json = JevValueToJSON(row_value, data.config.max_value_chars);
+		auto entry_key = CacheEntryKey(data.config.cache_scope, group->set.CacheKey(), row_json);
 
 		string cached;
 		if (session.Lookup(entry_key, cached)) {
 			session.stats.cache_hits++;
-			answers[i] = std::move(cached);
+			answers[i] = DecodeAnswers(cached);
 			resolved[i] = true;
 			continue;
 		}
 
-		auto group_entry = groups.find(question_key);
-		if (group_entry == groups.end()) {
-			auto group = make_uniq<JevGroup>();
-			group->question = std::move(question);
-			group_entry = groups.insert(make_pair(question_key, std::move(group))).first;
-		}
-		auto &group = *group_entry->second;
-		auto known = group.row_index.find(row_json);
+		auto known = group->row_index.find(row_json);
 		idx_t row_slot;
-		if (known == group.row_index.end()) {
-			row_slot = group.rows.size();
-			group.row_index.insert(make_pair(row_json, row_slot));
-			group.cache_keys.push_back(entry_key);
-			group.rows.push_back(std::move(row_json));
-			group.targets.emplace_back();
+		if (known == group->row_index.end()) {
+			row_slot = group->rows.size();
+			group->row_index.insert(make_pair(row_json, row_slot));
+			group->cache_keys.push_back(entry_key);
+			group->rows.push_back(std::move(row_json));
+			group->targets.emplace_back();
 		} else {
 			row_slot = known->second;
 		}
-		group.targets[row_slot].push_back(i);
+		group->targets[row_slot].push_back(i);
 	}
 
 	// Pass 2: everything the cache could not answer goes out in batches.
@@ -386,10 +642,7 @@ static void JevExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 			pending_chars += row.size();
 		}
 		pending_rows += group.rows.size();
-		for (idx_t start = 0; start < group.rows.size(); start += data.config.batch_size) {
-			auto batch_size = MinValue<idx_t>(data.config.batch_size, group.rows.size() - start);
-			batches.push_back(JevBatch {&group, start, batch_size});
-		}
+		PlanBatches(data.config, group, batches);
 	}
 
 	if (!batches.empty()) {
@@ -404,7 +657,8 @@ static void JevExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 				if (group.answers[slot].empty()) {
 					continue; // its batch failed
 				}
-				session.Store(group.cache_keys[slot], group.answers[slot], data.config.cache_max_entries);
+				session.Store(group.cache_keys[slot], EncodeAnswers(group.answers[slot]),
+				              data.config.cache_max_entries);
 				for (auto target : group.targets[slot]) {
 					answers[target] = group.answers[slot];
 					resolved[target] = true;
@@ -419,11 +673,13 @@ static void JevExecute(DataChunk &args, ExpressionState &state, Vector &result) 
 	}
 
 	// Pass 3: pick the field this function returns out of each answer.
+	static const vector<string> NO_NAMES;
 	for (idx_t i = 0; i < count; i++) {
 		if (!resolved[i]) {
 			continue;
 		}
-		WriteAnswer(data, result, i, answers[i], thresholds[i], level_counts[i]);
+		WriteAnswer(data, result, i, answers[i], row_groups[i] ? row_groups[i]->names : NO_NAMES, thresholds[i],
+		            level_counts[i]);
 	}
 }
 
@@ -493,6 +749,8 @@ void JevRegisterFunctions(ExtensionLoader &loader) {
 	auto any = LogicalType::ANY;
 	auto text = LogicalType::VARCHAR;
 	auto text_list = LogicalType::LIST(LogicalType::VARCHAR);
+	// labels (a list), or label -> what the label means (a MAP); checked in JevBind
+	auto labels = LogicalType::ANY;
 
 	// jev(row, condition [, threshold]) -> boolean
 	ScalarFunctionSet predicate("jev");
@@ -512,12 +770,12 @@ void JevRegisterFunctions(ExtensionLoader &loader) {
 	loader.RegisterFunction(MakeFunction("jev_score_norm", {any, text, text_list}, LogicalType::DOUBLE,
 	                                     JevBind<JevResult::SCORE_NORM, JevKindSource::SCORE, NO_ARG, 2, NO_ARG>));
 
-	// jev_choice(row, question, options) -> text
-	loader.RegisterFunction(MakeFunction("jev_choice", {any, text, text_list}, LogicalType::VARCHAR,
+	// jev_choice(row, question, options) -> text; options are labels, or a MAP of label -> description
+	loader.RegisterFunction(MakeFunction("jev_choice", {any, text, labels}, LogicalType::VARCHAR,
 	                                     JevBind<JevResult::CHOICE, JevKindSource::CHOICE, NO_ARG, 2, NO_ARG>));
 
 	// jev_confidence(row, question, kind, options) -> double
-	loader.RegisterFunction(MakeFunction("jev_confidence", {any, text, text, text_list}, LogicalType::DOUBLE,
+	loader.RegisterFunction(MakeFunction("jev_confidence", {any, text, text, labels}, LogicalType::DOUBLE,
 	                                     JevBind<JevResult::CONFIDENCE, JevKindSource::FROM_ARGUMENT, 2, 3, NO_ARG>));
 
 	// jev_eval(row, question [, kind [, options]]) -> json
@@ -526,9 +784,14 @@ void JevRegisterFunctions(ExtensionLoader &loader) {
 	                              JevBind<JevResult::EVAL, JevKindSource::NOUL, NO_ARG, NO_ARG, NO_ARG>));
 	eval.AddFunction(MakeFunction("jev_eval", {any, text, text}, JevJSONType(),
 	                              JevBind<JevResult::EVAL, JevKindSource::FROM_ARGUMENT, 2, NO_ARG, NO_ARG>));
-	eval.AddFunction(MakeFunction("jev_eval", {any, text, text, text_list}, JevJSONType(),
+	eval.AddFunction(MakeFunction("jev_eval", {any, text, text, labels}, JevJSONType(),
 	                              JevBind<JevResult::EVAL, JevKindSource::FROM_ARGUMENT, 2, 3, NO_ARG>));
 	loader.RegisterFunction(eval);
+
+	// jev_ask(row, questions) -> json: several named questions about one row, answered in one
+	// request over one state. questions is a JSON object of name -> question (see ParseQuestionSet).
+	loader.RegisterFunction(MakeFunction("jev_ask", {any, text}, JevJSONType(),
+	                                     JevBind<JevResult::ASK, JevKindSource::NOUL, NO_ARG, NO_ARG, NO_ARG>));
 
 	// Session helpers.
 	ScalarFunction stats("jev_stats", {}, JevJSONType(), JevStatsFunction);

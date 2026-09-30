@@ -1,0 +1,341 @@
+# name: test/sql/jev_ask.test
+# description: label descriptions, several questions per request, token-sized batches, truncation
+# group: [sql]
+
+#
+# Against test/mock_api.py (scripts/run_tests_with_mock.sh). The mock's answers carry
+# mock_* fields that report what the request contained, which is how these tests see
+# what was sent.
+
+require snx_jev
+
+require json
+
+require-env JEV_MOCK_API_URL
+
+require-env SNX_JEV_API_URL
+
+statement ok
+CREATE TABLE people (id INTEGER, name VARCHAR, note VARCHAR);
+
+statement ok
+INSERT INTO people VALUES (1, 'Ada', 'writes compilers'), (2, 'Bo', 'sells shoes'), (3, 'Cy', 'writes poetry');
+
+statement ok
+CREATE TABLE counters (phase INTEGER, stats JSON);
+
+statement ok
+CREATE MACRO delta(field, a, b) AS (
+  SELECT MAX(CASE WHEN phase = b THEN json_extract_string(stats, '$.' || field)::BIGINT END) -
+         MAX(CASE WHEN phase = a THEN json_extract_string(stats, '$.' || field)::BIGINT END)
+  FROM counters);
+
+statement ok
+SELECT jev_cache_clear();
+
+#
+# Label descriptions
+#
+
+# a MAP of label -> description is accepted, and the answer is one of the labels
+query I
+SELECT bool_and(jev_choice(people, 'which team should handle this?',
+                           MAP {'billing': 'money and invoices', 'technical': 'bugs and outages', 'sales': NULL})
+                IN ('billing', 'technical', 'sales'))
+FROM people;
+----
+true
+
+# the descriptions reach the request (a NULL description is sent as none)
+query I
+SELECT DISTINCT (jev_eval(people, 'which team should handle this?', 'choice',
+                          MAP {'billing': 'money and invoices', 'technical': 'bugs and outages', 'sales': NULL})
+                 ->>'mock_described')::INTEGER
+FROM people;
+----
+2
+
+query I
+SELECT DISTINCT (jev_eval(people, 'which team should handle this?', 'choice', ['billing', 'technical', 'sales'])
+                 ->>'mock_described')::INTEGER
+FROM people;
+----
+0
+
+# descriptions change the question, so they are a different cache entry
+statement ok
+SELECT jev_cache_clear();
+
+statement ok
+INSERT INTO counters SELECT 0, jev_stats();
+
+statement ok
+SELECT jev_choice(people, 'which team?', ['billing', 'technical']) FROM people;
+
+statement ok
+INSERT INTO counters SELECT 1, jev_stats();
+
+statement ok
+SELECT jev_choice(people, 'which team?', MAP {'billing': 'money', 'technical': 'bugs'}) FROM people;
+
+statement ok
+INSERT INTO counters SELECT 2, jev_stats();
+
+query II
+SELECT delta('rows_evaluated', 0, 1), delta('rows_evaluated', 1, 2);
+----
+3	3
+
+# a description on a score is refused: levels are ordered, not described
+statement error
+SELECT jev_eval(people, 'how senior?', 'score', MAP {'junior': 'new', 'senior': 'old'}) FROM people;
+----
+only a 'choice' question takes label descriptions
+
+#
+# jev_ask: several questions, one request
+#
+
+statement ok
+CREATE MACRO questions() AS '{
+  "team":   {"type": "choice", "question": "which team should handle this?",
+             "options": {"billing": "money and invoices", "technical": "bugs and outages", "sales": "new customers"}},
+  "coder":  {"type": "noul", "question": "the person writes compilers",
+             "criteria": {"true": "their job involves writing compilers", "false": "anything else"}},
+  "senior": {"type": "score", "question": "how senior is this person?", "levels": ["junior", "mid", "senior"]}
+}';
+
+statement ok
+SELECT jev_cache_clear();
+
+statement ok
+DELETE FROM counters;
+
+statement ok
+INSERT INTO counters SELECT 0, jev_stats();
+
+statement ok
+CREATE TABLE asked AS SELECT id, jev_ask(people, questions()) AS a FROM people;
+
+statement ok
+INSERT INTO counters SELECT 1, jev_stats();
+
+# three rows, three questions each: one request
+query II
+SELECT delta('requests', 0, 1), delta('rows_evaluated', 0, 1);
+----
+1	3
+
+# the answer is an object with one entry per question, in the order given
+query I
+SELECT DISTINCT json_keys(a) FROM asked;
+----
+[team, coder, senior]
+
+query II
+SELECT id, (a->'coder'->>'noul')::DOUBLE FROM asked ORDER BY id;
+----
+1	0.9
+2	0.1
+3	0.1
+
+query I
+SELECT bool_and(a->'team'->>'choice' IN ('billing', 'technical', 'sales')) FROM asked;
+----
+true
+
+# the choice answer carries its probabilities, keyed by label
+query I
+SELECT DISTINCT json_keys(a->'team'->'probabilities') FROM asked;
+----
+[billing, technical, sales]
+
+query I
+SELECT bool_and((a->'senior'->>'score')::DOUBLE BETWEEN 0 AND 2) FROM asked;
+----
+true
+
+# descriptions arrived for every question that had them
+query II
+SELECT DISTINCT (a->'team'->>'mock_described')::INTEGER, (a->'coder'->>'mock_described')::BOOLEAN FROM asked;
+----
+3	true
+
+# the second run is answered from cache
+statement ok
+SELECT jev_ask(people, questions()) FROM people;
+
+statement ok
+INSERT INTO counters SELECT 2, jev_stats();
+
+query I
+SELECT delta('rows_evaluated', 1, 2);
+----
+0
+
+# a different set of questions in the same column is its own group, and its own request
+statement ok
+SELECT jev_cache_clear();
+
+statement ok
+DELETE FROM counters;
+
+statement ok
+INSERT INTO counters SELECT 0, jev_stats();
+
+query I
+SELECT count(*) FROM (
+  SELECT jev_ask(people, CASE WHEN id = 1 THEN questions()
+                         ELSE '{"coder": {"type": "noul", "question": "the person writes compilers"}}' END) AS a
+  FROM people) WHERE a->'coder'->>'noul' IS NOT NULL;
+----
+3
+
+statement ok
+INSERT INTO counters SELECT 1, jev_stats();
+
+query I
+SELECT delta('requests', 0, 1);
+----
+2
+
+# NULLs in, NULL out, and nothing sent
+query II
+SELECT jev_ask(NULL, questions()), jev_ask({'name': 'Ada'}, NULL);
+----
+NULL	NULL
+
+#
+# jev_ask refuses questions it cannot send as asked
+#
+
+statement error
+SELECT jev_ask({'name': 'Ada'}, 'not json');
+----
+not valid JSON
+
+statement error
+SELECT jev_ask({'name': 'Ada'}, '{}');
+----
+non-empty JSON object
+
+statement error
+SELECT jev_ask({'name': 'Ada'}, '{"q": {"type": "rubric", "question": "?"}}');
+----
+unknown type 'rubric'
+
+statement error
+SELECT jev_ask({'name': 'Ada'}, '{"q": {"type": "choice", "question": "?", "option": ["a", "b"]}}');
+----
+unexpected field "option"
+
+statement error
+SELECT jev_ask({'name': 'Ada'}, '{"q": {"type": "choice", "question": "?", "options": ["a", "a"]}}');
+----
+repeats the option 'a'
+
+statement error
+SELECT jev_ask({'name': 'Ada'}, '{"q": {"type": "score", "question": "?", "levels": ["only"]}}');
+----
+needs 2 to 10 levels
+
+statement error
+SELECT jev_ask({'name': 'Ada'}, '{"q": {"type": "noul", "question": "?", "criteria": {"yes": "a", "no": "b"}}}');
+----
+the criteria of noul question 'q'
+
+statement error
+SELECT jev_ask({'name': 'Ada'}, '{"q": {"type": "noul"}}');
+----
+needs a non-empty string "question"
+
+#
+# Batches close by estimated tokens, not only by row count
+#
+
+statement ok
+SELECT jev_cache_clear();
+
+query I
+SELECT DISTINCT (jev_eval(people, 'the person writes poetry')->>'mock_batch_rows')::INTEGER FROM people;
+----
+3
+
+statement ok
+SELECT jev_cache_clear();
+
+statement ok
+SET snx_jev_max_batch_tokens = 1;
+
+statement ok
+DELETE FROM counters;
+
+statement ok
+INSERT INTO counters SELECT 0, jev_stats();
+
+# every row is over a 1-token budget on its own, so each goes out alone
+query I
+SELECT DISTINCT (jev_eval(people, 'the person writes poetry')->>'mock_batch_rows')::INTEGER FROM people;
+----
+1
+
+statement ok
+INSERT INTO counters SELECT 1, jev_stats();
+
+query I
+SELECT delta('requests', 0, 1);
+----
+3
+
+statement ok
+RESET snx_jev_max_batch_tokens;
+
+#
+# Strings are cut to snx_jev_max_value_chars characters (code points, not bytes)
+#
+
+query I
+SELECT (jev_eval(repeat('é', 3000), 'the text is French')->>'mock_row_chars')::INTEGER;
+----
+2000
+
+statement ok
+SET snx_jev_max_value_chars = 10;
+
+query I
+SELECT (jev_eval(repeat('é', 3000), 'the text is French')->>'mock_row_chars')::INTEGER;
+----
+10
+
+statement ok
+SET snx_jev_max_value_chars = 0;
+
+query I
+SELECT (jev_eval(repeat('é', 3000), 'the text is French')->>'mock_row_chars')::INTEGER;
+----
+3000
+
+statement ok
+RESET snx_jev_max_value_chars;
+
+# the cut applies inside structs too: a 5000-character field fits a 2100-character budget
+# only because it was cut to 2000 before sending
+statement ok
+SET snx_jev_max_chars_per_statement = 2100;
+
+statement ok
+SELECT jev({'note': repeat('x', 5000)}, 'the note is long');
+
+statement ok
+SET snx_jev_max_value_chars = 0;
+
+statement error
+SELECT jev({'note': repeat('x', 5000)}, 'the note is long');
+----
+snx_jev_max_chars_per_statement
+
+statement ok
+RESET snx_jev_max_value_chars;
+
+statement ok
+RESET snx_jev_max_chars_per_statement;

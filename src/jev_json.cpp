@@ -56,24 +56,43 @@ string JevQuoteJSONString(const string &text) {
 	return out;
 }
 
-static void WriteValue(const Value &value, string &out);
+static void WriteValue(const Value &value, idx_t max_chars, string &out);
 
 static void WriteQuoted(const Value &value, string &out) {
 	JevWriteJSONString(value.ToString(), out);
 }
 
-static void WriteChildren(const vector<Value> &children, string &out) {
+//! `text` cut to its first `max_chars` characters (UTF-8 code points, not bytes, so a
+//! multi-byte character is never split). 0 keeps everything.
+static string Truncate(const string &text, idx_t max_chars) {
+	if (max_chars == 0 || text.size() <= max_chars) {
+		return text;
+	}
+	idx_t chars = 0;
+	for (idx_t i = 0; i < text.size(); i++) {
+		// A byte that is not a continuation byte (10xxxxxx) starts a character.
+		if ((static_cast<unsigned char>(text[i]) & 0xC0) != 0x80) {
+			if (chars == max_chars) {
+				return text.substr(0, i);
+			}
+			chars++;
+		}
+	}
+	return text;
+}
+
+static void WriteChildren(const vector<Value> &children, idx_t max_chars, string &out) {
 	out += '[';
 	for (idx_t i = 0; i < children.size(); i++) {
 		if (i > 0) {
 			out += ',';
 		}
-		WriteValue(children[i], out);
+		WriteValue(children[i], max_chars, out);
 	}
 	out += ']';
 }
 
-static void WriteValue(const Value &value, string &out) {
+static void WriteValue(const Value &value, idx_t max_chars, string &out) {
 	if (value.IsNull()) {
 		out += "null";
 		return;
@@ -109,7 +128,7 @@ static void WriteValue(const Value &value, string &out) {
 		return;
 	}
 	case LogicalTypeId::VARCHAR:
-		WriteQuoted(value, out);
+		JevWriteJSONString(Truncate(StringValue::Get(value), max_chars), out);
 		return;
 	case LogicalTypeId::BLOB: {
 		auto blob = value.GetValueUnsafe<string_t>();
@@ -126,16 +145,16 @@ static void WriteValue(const Value &value, string &out) {
 			}
 			JevWriteJSONString(child_types[i].first, out);
 			out += ':';
-			WriteValue(children[i], out);
+			WriteValue(children[i], max_chars, out);
 		}
 		out += '}';
 		return;
 	}
 	case LogicalTypeId::LIST:
-		WriteChildren(ListValue::GetChildren(value), out);
+		WriteChildren(ListValue::GetChildren(value), max_chars, out);
 		return;
 	case LogicalTypeId::ARRAY:
-		WriteChildren(ArrayValue::GetChildren(value), out);
+		WriteChildren(ArrayValue::GetChildren(value), max_chars, out);
 		return;
 	case LogicalTypeId::MAP: {
 		// A MAP becomes a JSON object; keys that are not strings are stringified.
@@ -148,13 +167,13 @@ static void WriteValue(const Value &value, string &out) {
 			}
 			JevWriteJSONString(entry[0].ToString(), out);
 			out += ':';
-			WriteValue(entry[1], out);
+			WriteValue(entry[1], max_chars, out);
 		}
 		out += '}';
 		return;
 	}
 	case LogicalTypeId::UNION:
-		WriteValue(UnionValue::GetValue(value), out);
+		WriteValue(UnionValue::GetValue(value), max_chars, out);
 		return;
 	default:
 		// Dates, timestamps, intervals, uuids, enums, bits: their text form is what a
@@ -164,9 +183,9 @@ static void WriteValue(const Value &value, string &out) {
 	}
 }
 
-string JevValueToJSON(const Value &value) {
+string JevValueToJSON(const Value &value, idx_t max_chars) {
 	string out;
-	WriteValue(value, out);
+	WriteValue(value, max_chars, out);
 	return out;
 }
 
