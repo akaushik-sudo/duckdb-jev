@@ -50,7 +50,7 @@ for the design are in analytics-schema's prompt intent spec (`ollylake/prompt_in
   other process that runs untrusted SQL needs the same guard. Also process-wide and callable by
   any connection today: `jev_cache_clear()` and the `snx_jev_cache_max_entries` eviction (P3/P5).
 
-## P2 — What our questions need (done, pending the live check)
+## P2 — What our questions need (done)
 
 - `choice` criteria carry descriptions (label → description), not bare labels.
 - Several questions per row share one request, so intent and malicious cost one call.
