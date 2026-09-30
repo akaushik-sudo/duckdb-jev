@@ -4,20 +4,29 @@
 
 namespace duckdb {
 
-//! The one endpoint this process may send to, fixed when the extension loads.
+//! What this process may send, and where: read from the environment once, when the
+//! extension loads, and never again.
 //!
-//! Nothing in SQL can change it: there is no URL setting. The default is TypeSafe's API.
-//! SNX_JEV_API_URL may replace it, but only with a loopback address (the test mock);
-//! any other value is recorded as a refusal, and every request fails with it before a
-//! connection is opened.
-struct JevEndpoint {
-	//! Empty when the configured endpoint was refused.
-	string url;
-	//! Why it was refused; empty when url is set.
+//! Nothing in SQL can change either: there is no URL or key setting. The endpoint is
+//! TypeSafe's API; SNX_JEV_API_URL may replace it, but only with a loopback address (the
+//! test mock). Any other value is recorded as a refusal, and every request fails with it
+//! before a connection is opened.
+//!
+//! The key comes from TYPESAFE_API_KEY. That keeps it out of current_setting() and
+//! duckdb_settings(), but not out of /proc/self/environ on Linux, which any query can read
+//! while DuckDB's external access is enabled. The deployment has to switch that off.
+struct JevEnvironment {
+	//! Canonical "scheme://host:port"; empty when the endpoint was refused.
+	string origin;
+	//! The request path, e.g. "/v1/systemone".
+	string path;
+	//! Why the endpoint was refused; empty when origin is set.
 	string refusal;
+	//! TYPESAFE_API_KEY as it was at load; empty when unset.
+	string api_key;
 
-	//! Resolved once, on first use (the extension calls it at load), then never again.
-	static const JevEndpoint &Get();
+	//! Resolved once, on first use (the extension calls it at load).
+	static const JevEnvironment &Get();
 };
 
 //! Every snx_jev_* setting, resolved for one query.
@@ -25,11 +34,9 @@ struct JevEndpoint {
 //! Settings are read once per bind (i.e. per query), so `SET snx_jev_batch_size = 40`
 //! takes effect on the next statement and never changes mid-scan.
 struct JevConfig {
-	//! From TYPESAFE_API_KEY only. There is deliberately no setting for it: a setting's value
-	//! can be read back by any query through current_setting() / duckdb_settings().
+	//! JevEnvironment::Get().api_key. There is deliberately no setting for it: a setting's
+	//! value can be read back by any query through current_setting() / duckdb_settings().
 	string api_key;
-	//! JevEndpoint::Get().url, copied here for the request code.
-	string api_url;
 	//! Namespaces the answer cache: the connection's `scope_customer_id` variable, which
 	//! the search service sets from the verified token. Empty when the variable is unset
 	//! (a hand-run session), which is a namespace of its own.

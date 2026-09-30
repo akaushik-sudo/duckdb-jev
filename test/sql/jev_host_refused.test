@@ -13,10 +13,18 @@ require json
 
 require-env JEV_ASSERT_HOST_REFUSED
 
+require-env SNX_JEV_API_URL
+
 statement error
 SELECT jev({'name': 'Ada'}, 'the name is European');
 ----
 refusing SNX_JEV_API_URL
+
+# ...without repeating the refused value: it reaches every caller, and can carry credentials
+statement error
+SELECT jev({'name': 'Ada'}, 'the name is European');
+----
+<!REGEX>:.*(snxleak|evil|nip\.io|user:|99999|65536|%2e|ftp:).*
 
 # The refusal is fixed for the process: no setting brings the request back
 statement error

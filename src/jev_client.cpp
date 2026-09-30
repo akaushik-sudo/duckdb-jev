@@ -27,22 +27,6 @@ string JevQuestion::CacheKey() const {
 	return key;
 }
 
-//! Splits "https://api.typesafe.ai/v1/systemone" into "https://api.typesafe.ai" and "/v1/systemone".
-static void SplitURL(const string &url, string &origin, string &path) {
-	auto scheme_end = url.find("://");
-	if (scheme_end == string::npos) {
-		throw InvalidInputException("snx_jev: the API URL must start with http:// or https:// (got '%s')", url);
-	}
-	auto path_start = url.find('/', scheme_end + 3);
-	if (path_start == string::npos) {
-		origin = url;
-		path = "/";
-		return;
-	}
-	origin = url.substr(0, path_start);
-	path = url.substr(path_start);
-}
-
 //! One client per thread per origin. httplib keeps the connection alive between
 //! requests on the same client, and a client is not safe to share between threads,
 //! so this is both the connection pool and the thread-safety story.
@@ -163,8 +147,10 @@ static double Jitter() {
 vector<string> JevCallAPI(const JevConfig &config, const JevQuestion &question, const vector<string> &rows_json) {
 	config.RequireSendable();
 
-	string origin, path;
-	SplitURL(config.api_url, origin, path);
+	// RequireSendable() has checked it was not refused; origin is canonical scheme://host:port.
+	auto &environment = JevEnvironment::Get();
+	auto &origin = environment.origin;
+	auto &path = environment.path;
 	auto body = BuildRequestBody(config, question, rows_json);
 	http::Headers headers = {{"Authorization", "Bearer " + config.api_key}, {"User-Agent", "snx-jev/" JEV_VERSION}};
 

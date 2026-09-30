@@ -10,6 +10,8 @@ require json
 # mock and TYPESAFE_API_KEY set to the mock's key; SQL can set neither.
 require-env JEV_MOCK_API_URL
 
+require-env SNX_JEV_API_URL
+
 statement ok
 CREATE TABLE people (id INTEGER, name VARCHAR, note VARCHAR);
 

@@ -10,6 +10,8 @@ require snx_jev
 
 require-env JEV_ASSERT_UNREACHABLE
 
+require-env SNX_JEV_API_URL
+
 # The spend guard stops the statement before the request goes out
 statement ok
 SET snx_jev_max_rows_per_statement = 1;

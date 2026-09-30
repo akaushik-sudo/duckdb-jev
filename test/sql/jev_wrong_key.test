@@ -10,6 +10,8 @@ require snx_jev
 
 require-env JEV_ASSERT_WRONG_KEY
 
+require-env SNX_JEV_API_URL
+
 statement error
 SELECT jev(people, 'the person writes compilers') FROM (VALUES ('Ada')) people(name);
 ----

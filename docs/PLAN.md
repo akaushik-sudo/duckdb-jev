@@ -18,14 +18,18 @@ for the design are in analytics-schema's prompt intent spec (`ollylake/prompt_in
 ## P1 — Harden (done)
 
 - **Endpoint:** fixed once per process, at LOAD. The default is `https://api.typesafe.ai/v1/systemone`.
-  `SNX_JEV_API_URL` may replace it only with loopback (`localhost` / `127.0.0.1` / `[::1]`, numeric
-  port). Anything else, including userinfo (`@`), backslash, whitespace, lookalike hosts and other
-  schemes, is recorded as a refusal, and every request fails with it before a connection opens.
-  The `jev_api_url` setting is gone.
-- **Key:** only from `TYPESAFE_API_KEY`, and the `jev_api_key` setting is gone, so
-  `current_setting()` / `duckdb_settings()` have nothing to show. The JDBC and Python clients have no
-  SQL `getenv()`; only the CLI shell does. A DuckDB secret was not added: the environment is what
-  search's deployment already uses.
+  `SNX_JEV_API_URL` may replace it only with loopback (`localhost` / `127.0.0.1` / `[::1]`, port
+  1-65535). The URL is parsed once, strictly; the HTTP client is built from the canonical
+  `scheme://host:port` of that parse, so no second parser can read it differently. Anything else,
+  including userinfo (`@`), backslash, queries, percent-escapes, lookalike hosts and other schemes,
+  is recorded as a refusal (without repeating the value), and every request fails with it before a
+  connection opens. The `jev_api_url` setting is gone.
+- **Key:** only from `TYPESAFE_API_KEY`, read once at LOAD, and the `jev_api_key` setting is gone,
+  so `current_setting()` / `duckdb_settings()` have nothing to show. The JDBC and Python clients have no
+  SQL `getenv()`; only the CLI shell does. **But on Linux, `read_text('/proc/self/environ')` returns
+  the environment while external access is on**, so the key is protected only once P5 switches file
+  access off (see P5). A DuckDB secret was not added: the environment is what search's deployment
+  already uses.
 - **Cache:** namespaced by the connection's `scope_customer_id` variable, which search already pins
   from the verified token (`ClassicSearchEngineV2.pinCustomerScope`). No argument was needed, so
   P3 stays single-argument. An unset variable is a namespace of its own.
@@ -35,8 +39,16 @@ for the design are in analytics-schema's prompt intent spec (`ollylake/prompt_in
 - Tests: one `unittest` process per environment (`scripts/run_tests_with_mock.sh`): offline, no key,
   mock, wrong key, unreachable, and ten hostile URLs. Several of those would reach the running mock
   if let through; a negative control, the same test run with the real mock URL, fails as it should.
+- Tests: every file that can send requires `SNX_JEV_API_URL`, and the runner refuses to give a
+  sending case anything but loopback. The runner fails if a `test/sql/*.test` has no case in it, and
+  takes one file as an argument again.
+- CI: release binaries (`duckdb-stable-build`) need `mock-api-tests` to pass.
 - Still global, on purpose until P3 removes them from the search path: `jev_stats()` counters and
   the `snx_jev_*` settings. P5 freezes the settings with `lock_configuration = true`.
+- **Trust assumption:** the cache split trusts `scope_customer_id`, an ordinary `SET VARIABLE`. It
+  holds for search because search's query guard rejects `SET` statements in generated SQL. Any
+  other process that runs untrusted SQL needs the same guard. Also process-wide and callable by
+  any connection today: `jev_cache_clear()` and the `snx_jev_cache_max_entries` eviction (P3/P5).
 
 ## P2 — What our questions need
 
@@ -63,6 +75,9 @@ snx_prompt_intent(user_prompt VARCHAR)
 - NULL in → NULL out, and nothing is sent.
 - VARCHAR only: a whole row or struct cannot be passed.
 - The questions, labels, descriptions and taxonomy version are compiled in; SQL cannot change what is asked.
+- Read the cache scope (`scope_customer_id`) when the query **runs**, not at bind: DuckDB does not
+  rebind a prepared statement when a variable changes, so a statement prepared under one customer and
+  run after the connection is re-pinned would use the old customer's namespace.
 - The generic `jev`, `jev_prob`, `jev_choice`, `jev_score`, `jev_score_norm`, `jev_confidence`
   and `jev_eval` are **not registered**. `jev_stats` / `jev_cache_clear` stay off the search path too.
 - **Encryption, when sgwe implements it:** `user_prompt` would hold ciphertext. That leaks no
@@ -81,6 +96,11 @@ snx_prompt_intent(user_prompt VARCHAR)
 
 - `services/search/conf/connect.sql`: `LOAD` it, set the caps, then `enable_external_access = false`
   and `lock_configuration = true`. `TYPESAFE_API_KEY` goes in search's deployment env.
+- **Prove the key is unreadable** from generated SQL before enabling it: `read_text` /
+  `read_blob` / `read_csv` on `/proc/self/environ` must fail. Search reads the lake from S3 and local
+  caches, so `enable_external_access = false` needs `allowed_directories` / `allowed_paths` for those,
+  and it must be tested with the real lake. If that cannot be made to work, change the key source
+  (a file outside the allowed paths, or handed over by search's Java at startup) before rollout.
 - Teach `ai_log_search.yaml` when to call `snx_prompt_intent(user_prompt)`; add eval cases against the mock.
 - CI guard: `http_client` stays banned; `snx_jev` is allowed only in search's connect.sql.
 - Retire `ollylake/jev/jev_macros.sql` (branch `demo/prompt-jev-batch`).

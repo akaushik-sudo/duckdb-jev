@@ -12,73 +12,136 @@ static constexpr const char *DEFAULT_API_URL = "https://api.typesafe.ai/v1/syste
 //! Name of the variable the search service pins per connection (ClassicSearchEngineV2).
 static constexpr const char *CACHE_SCOPE_VARIABLE = "scope_customer_id";
 
-//! True for http(s)://localhost, 127.0.0.1 or [::1], with any port and path. Anything
-//! that needs DNS or leaves the machine is not loopback.
-static bool IsLoopbackURL(const string &url) {
-	for (auto c : url) {
-		// '@' is userinfo ("http://localhost:80@evil.example" goes to evil.example), '\\' is
-		// normalised to '/' by some parsers, and whitespace or controls can split a request line.
-		if (c == '@' || c == '\\' || static_cast<unsigned char>(c) <= 0x20 || c == 0x7f) {
-			return false;
-		}
-	}
+//! A URL taken apart once. Everything downstream (the loopback check and the HTTP client)
+//! uses these fields, never the original string, so no second parser can read the URL
+//! differently from the one that approved it.
+struct ParsedURL {
+	string scheme;
+	//! Lower-case, without brackets for IPv6
+	string host;
+	int port = 0;
+	string path;
+};
+
+//! Strict on purpose: only http(s), a hostname or bracketed IPv6 literal, an optional port
+//! in 1..65535 and a plain path. No userinfo, query, fragment, backslash, percent-escape,
+//! whitespace or control character: none is needed to reach an API endpoint, and each is
+//! a way for two URL parsers to disagree about the host.
+static bool ParseURL(const string &url, ParsedURL &out, string &reason) {
 	string rest;
 	if (StringUtil::StartsWith(url, "http://")) {
+		out.scheme = "http";
 		rest = url.substr(7);
 	} else if (StringUtil::StartsWith(url, "https://")) {
+		out.scheme = "https";
 		rest = url.substr(8);
 	} else {
+		reason = "not an http:// or https:// URL";
 		return false;
 	}
-	string host;
-	if (!rest.empty() && rest[0] == '[') {
-		auto close = rest.find(']');
+	auto authority_end = rest.find('/');
+	auto authority = rest.substr(0, authority_end);
+	out.path = authority_end == string::npos ? string("/") : rest.substr(authority_end);
+
+	string port;
+	if (!authority.empty() && authority[0] == '[') {
+		auto close = authority.find(']');
 		if (close == string::npos) {
+			reason = "malformed IPv6 host";
 			return false;
 		}
-		host = rest.substr(0, close + 1);
-		rest = rest.substr(close + 1);
+		out.host = authority.substr(1, close - 1);
+		if (out.host.empty() || out.host.find_first_not_of("0123456789abcdefABCDEF:") != string::npos) {
+			reason = "malformed IPv6 host";
+			return false;
+		}
+		auto after = authority.substr(close + 1);
+		if (!after.empty()) {
+			if (after[0] != ':') {
+				reason = "unexpected text after the host";
+				return false;
+			}
+			port = after.substr(1);
+		}
 	} else {
-		auto end = rest.find_first_of(":/?#");
-		host = rest.substr(0, end);
-		rest = end == string::npos ? string() : rest.substr(end);
-	}
-	if (!rest.empty() && rest[0] == ':') {
-		// The port is digits only, up to the path.
-		auto port_end = rest.find('/');
-		auto port = rest.substr(1, port_end == string::npos ? string::npos : port_end - 1);
-		if (port.empty() || port.find_first_not_of("0123456789") != string::npos) {
+		auto colon = authority.find(':');
+		out.host = authority.substr(0, colon);
+		if (colon != string::npos) {
+			port = authority.substr(colon + 1);
+		}
+		if (out.host.empty() ||
+		    out.host.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-") !=
+		        string::npos) {
+			reason = "invalid host";
 			return false;
 		}
-		rest = port_end == string::npos ? string() : rest.substr(port_end);
 	}
-	if (!rest.empty() && rest[0] != '/') {
+	out.host = StringUtil::Lower(out.host);
+
+	if (port.empty()) {
+		if (authority.find(':') != string::npos && authority.back() == ':') {
+			reason = "invalid port";
+			return false;
+		}
+		out.port = out.scheme == "https" ? 443 : 80;
+	} else {
+		if (port.size() > 5 || port.find_first_not_of("0123456789") != string::npos) {
+			reason = "invalid port";
+			return false;
+		}
+		out.port = std::stoi(port);
+		if (out.port < 1 || out.port > 65535) {
+			reason = "invalid port";
+			return false;
+		}
+	}
+
+	if (out.path.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~/") !=
+	    string::npos) {
+		reason = "invalid path";
 		return false;
 	}
-	host = StringUtil::Lower(host);
-	return host == "localhost" || host == "127.0.0.1" || host == "[::1]";
+	return true;
 }
 
-static JevEndpoint ResolveEndpoint() {
-	JevEndpoint endpoint;
+static bool IsLoopbackHost(const string &host) {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1";
+}
+
+static JevEnvironment ResolveEnvironment() {
+	JevEnvironment environment;
+
+	auto key = std::getenv("TYPESAFE_API_KEY");
+	environment.api_key = key ? string(key) : string();
+
 	auto from_env = std::getenv("SNX_JEV_API_URL");
 	string requested = from_env ? string(from_env) : string();
-	if (requested.empty() || requested == DEFAULT_API_URL) {
-		endpoint.url = DEFAULT_API_URL;
-		return endpoint;
+	bool overridden = !requested.empty() && requested != DEFAULT_API_URL;
+
+	ParsedURL url;
+	string reason;
+	if (!ParseURL(overridden ? requested : string(DEFAULT_API_URL), url, reason)) {
+		// The value itself is never repeated: it would reach every caller whose query touched
+		// jev(), and a proxy URL can carry credentials.
+		environment.refusal = "snx_jev: refusing SNX_JEV_API_URL (" + reason + "). Requests go to " +
+		                      string(DEFAULT_API_URL) + ", or to a loopback address for tests.";
+		return environment;
 	}
-	if (IsLoopbackURL(requested)) {
-		endpoint.url = requested;
-		return endpoint;
+	if (overridden && !IsLoopbackHost(url.host)) {
+		environment.refusal = "snx_jev: refusing SNX_JEV_API_URL (not a loopback host). Requests go to " +
+		                      string(DEFAULT_API_URL) + ", or to a loopback address for tests.";
+		return environment;
 	}
-	endpoint.refusal = "snx_jev: refusing SNX_JEV_API_URL '" + requested + "'. Requests go to " + DEFAULT_API_URL +
-	                   ", or to a loopback address for tests.";
-	return endpoint;
+	auto host = url.host.find(':') != string::npos ? "[" + url.host + "]" : url.host;
+	// Canonical and fully explicit, so the HTTP library's own parser has nothing to interpret.
+	environment.origin = url.scheme + "://" + host + ":" + to_string(url.port);
+	environment.path = url.path;
+	return environment;
 }
 
-const JevEndpoint &JevEndpoint::Get() {
-	static const JevEndpoint endpoint = ResolveEndpoint();
-	return endpoint;
+const JevEnvironment &JevEnvironment::Get() {
+	static const JevEnvironment environment = ResolveEnvironment();
+	return environment;
 }
 
 void JevConfig::RegisterSettings(DBConfig &config) {
@@ -119,9 +182,7 @@ JevConfig JevConfig::FromContext(ClientContext &context) {
 	JevConfig config;
 	Value value;
 
-	auto key = std::getenv("TYPESAFE_API_KEY");
-	config.api_key = key ? string(key) : string();
-	config.api_url = JevEndpoint::Get().url;
+	config.api_key = JevEnvironment::Get().api_key;
 	if (ClientConfig::GetConfig(context).GetUserVariable(CACHE_SCOPE_VARIABLE, value) && !value.IsNull()) {
 		config.cache_scope = value.ToString();
 	}
@@ -157,9 +218,9 @@ JevConfig JevConfig::FromContext(ClientContext &context) {
 }
 
 void JevConfig::RequireSendable() const {
-	auto &endpoint = JevEndpoint::Get();
-	if (endpoint.url.empty()) {
-		throw InvalidInputException(endpoint.refusal);
+	auto &environment = JevEnvironment::Get();
+	if (environment.origin.empty()) {
+		throw InvalidInputException(environment.refusal);
 	}
 	if (api_key.empty()) {
 		throw InvalidInputException("snx_jev: no API key. Start DuckDB with TYPESAFE_API_KEY set in the environment.");

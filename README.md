@@ -4,8 +4,11 @@
 
 > **Sentrinox fork.** `snx_jev` is a private fork of
 > [judoaseeta/duckdb-jev](https://github.com/judoaseeta/duckdb-jev) (MIT, forked at 0.1.0,
-> `58e5484`). It is renamed so it can never be mistaken for, or collide with, the community `jev`
-> extension, and it is pinned to the DuckDB version the analytics services run (v1.5.4). It is being
+> `58e5484`). The extension and its settings are renamed so they cannot be mistaken for the
+> community `jev` extension, and it is pinned to the DuckDB version the analytics services run
+> (v1.5.4). The functions still carry upstream's names (`jev`, `jev_prob`, ...), so **do not load
+> it into a process that also loads community `jev`**: the second LOAD fails on the duplicate
+> functions. P3 replaces them with `snx_prompt_intent`. It is being
 > narrowed to one hardened function, `snx_prompt_intent`, for classifying `ai_txn` prompts. Until
 > that lands, everything below describes the upstream functions, unchanged apart from the extension name.
 > `upstream` in a clone is judoaseeta's repo; nothing is pushed there.
@@ -84,17 +87,24 @@ LOAD '/path/to/duckdb-jev/build/release/extension/snx_jev/snx_jev.duckdb_extensi
 ### API key
 
 Get one from https://console.typesafe.ai and export `TYPESAFE_API_KEY` in the environment DuckDB
-starts in. That is the only place a key comes from: there is no setting for it, because any query
-can read a setting back through `current_setting()` or `duckdb_settings()`. The embedded clients
-(JDBC, Python) have no SQL function that reads the environment; only the DuckDB CLI has `getenv()`.
+starts in. It is read once, when the extension loads; changing the variable afterwards has no effect.
+That is the only place a key comes from: there is no setting for it, because any query can read a
+setting back through `current_setting()` or `duckdb_settings()`.
+
+**That alone does not keep the key from SQL.** The embedded clients (JDBC, Python) have no `getenv()`
+(only the DuckDB CLI does), but on Linux any query can read the process environment as a file,
+`read_text('/proc/self/environ')`, while DuckDB's external access is enabled, which is the default.
+A process that runs untrusted SQL must also stop file reads outside the paths it needs
+(`enable_external_access = false`, with `allowed_directories` / `allowed_paths` for the data it does
+read) before the key can be considered protected.
 
 ### Endpoint
 
 Requests go to `https://api.typesafe.ai/v1/systemone` and nowhere else. The endpoint is fixed when
 the extension loads, and there is no setting to change it. `SNX_JEV_API_URL` in the environment may
-replace it only with a **loopback** address (`localhost`, `127.0.0.1` or `[::1]`, any port), for the
-test mock. Any other value is refused, and every request then fails with the refusal before a
-connection is opened.
+replace it only with a **loopback** address (`localhost`, `127.0.0.1` or `[::1]`, port 1-65535, a plain
+path), for the test mock. Any other value is refused, and every request then fails with the refusal
+before a connection is opened. The refusal does not repeat the value, which could carry credentials.
 
 ## Functions
 
