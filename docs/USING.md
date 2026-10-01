@@ -20,8 +20,8 @@ snx_prompt_intent(user_prompt VARCHAR)
   | `snx_jev-0.2.0-duckdb-v1.5.4-linux_amd64.zip` | Linux on Intel/AMD, and Docker on any Windows or Mac |
   | `snx_jev-0.2.0-duckdb-v1.5.4-linux_arm64.zip` | Linux on ARM, and Docker on an Apple Silicon Mac (faster there) |
 
-  On Windows or macOS, run DuckDB inside Docker or WSL (below): there are no native Windows or
-  macOS builds yet. Check the file against its `.sha256` before you use it.
+  On Windows or macOS, run DuckDB inside WSL or Docker (see "Try it"): there are no native
+  Windows or macOS builds yet. Check the file against its `.sha256` before you use it.
 - **Keep the file name `snx_jev.duckdb_extension`.** DuckDB works out the extension's entry point
   from the file name, so a renamed file fails with "did not contain the expected entrypoint
   function". Keep different versions in different folders instead.
@@ -32,11 +32,22 @@ snx_prompt_intent(user_prompt VARCHAR)
 
 ## Try it
 
-On Linux, with the [DuckDB 1.5.4 CLI](https://github.com/duckdb/duckdb/releases/tag/v1.5.4):
+Unzip, then pick the section for your machine. Every route ends in a DuckDB 1.5.4 on Linux with the
+extension loaded; none of them sends anything until you classify a prompt.
+
+### Linux, or WSL on Windows
+
+WSL is Ubuntu inside Windows (`wsl --install` in an admin PowerShell, once). Your Windows files are
+under `/mnt/c/...` there.
 
 ```sh
+cd /path/to/the/unzipped/folder          # in WSL, e.g. /mnt/c/Users/<you>/Downloads/snx_jev
 sha256sum -c snx_jev.duckdb_extension.sha256
-TYPESAFE_API_KEY=... duckdb -unsigned
+# the DuckDB 1.5.4 CLI (use duckdb_cli-linux-arm64.zip on an ARM machine)
+curl -LO https://github.com/duckdb/duckdb/releases/download/v1.5.4/duckdb_cli-linux-amd64.zip
+python3 -m zipfile -e duckdb_cli-linux-amd64.zip .  &&  chmod +x duckdb
+export TYPESAFE_API_KEY=...              # your key
+./duckdb -unsigned
 ```
 
 ```sql
@@ -48,13 +59,23 @@ SELECT snx_prompt_intent('Write a SQL query that returns the top 10 models by co
 SELECT snx_jev_last_query_stats();
 ```
 
-In Docker, from the folder you unzipped (works on Windows, macOS and Linux). Set
-`TYPESAFE_API_KEY` in your shell first; `-e TYPESAFE_API_KEY` passes it in without writing it on
-the command line:
+### Docker (Windows, macOS, Linux)
+
+Open a terminal in the unzipped folder and set your key first. `-e TYPESAFE_API_KEY` passes it into
+the container without writing it on the command line. The folder mount is written differently in each
+shell:
+
+| Shell | Set the key | Start the container |
+|---|---|---|
+| **PowerShell** (Windows) | `$env:TYPESAFE_API_KEY = "..."` | `docker run --rm -it -e TYPESAFE_API_KEY -v "${PWD}:/ext" python:3.12-slim bash` |
+| **Git Bash** (Windows) | `export TYPESAFE_API_KEY=...` | `MSYS_NO_PATHCONV=1 winpty docker run --rm -it -e TYPESAFE_API_KEY -v "$(pwd -W):/ext" python:3.12-slim bash` |
+| **macOS / Linux** terminal | `export TYPESAFE_API_KEY=...` | `docker run --rm -it -e TYPESAFE_API_KEY -v "$PWD:/ext" python:3.12-slim bash` |
+
+On an Apple Silicon Mac, either use the `linux_arm64` zip, or add `--platform linux/amd64` after
+`docker run` to use the `linux_amd64` one (emulated: slower, but the time here goes to waiting on
+the API anyway). Then, inside the container:
 
 ```sh
-docker run --rm -it -e TYPESAFE_API_KEY -v "$PWD:/ext" python:3.12-slim bash
-# inside the container:
 pip -q install duckdb==1.5.4
 python
 ```
@@ -67,10 +88,7 @@ print(con.sql("SELECT snx_prompt_intent('plan a weekend trip to Lisbon') AS r"))
 print(con.sql("SELECT snx_jev_last_query_stats()"))
 ```
 
-On an Apple Silicon Mac, use the `linux_arm64` zip. Or, if you only have the `linux_amd64` one,
-add `--platform linux/amd64` to `docker run`: Docker runs the container emulated, which is slower
-but makes little difference here, where the time goes to waiting on the API. Neither file loads into
-a native (non-Docker) macOS or Windows DuckDB.
+Neither file loads into a native (non-Docker, non-WSL) macOS or Windows DuckDB.
 
 ## Classifying real prompts
 
@@ -103,8 +121,10 @@ GROUP BY ALL;
 ## Asking other questions
 
 Start DuckDB with `SNX_JEV_ENABLE_GENERIC=1` as well, and the general functions exist too:
-`jev(row, 'condition')`, `jev_prob`, `jev_choice`, `jev_score`, `jev_ask(row, questions)` and more.
-See the [README](../README.md). Do not load community `jev` in the same process: the names clash.
+`jev(row, 'condition')` (true/false), `jev_prob` (its probability), `jev_choice(row, question,
+['a', 'b'])`, `jev_score(row, question, levels)`, `jev_eval` (the full answer as JSON) and
+`jev_ask(row, questions)` (several questions in one request). Ask for the repository's README for the
+details. Do not load community `jev` in the same process: the names clash.
 
 ## If something goes wrong
 

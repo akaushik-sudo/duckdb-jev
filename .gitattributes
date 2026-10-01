@@ -1,0 +1,7 @@
+# Scripts and tests run in Linux containers from a git archive: keep them LF on every checkout,
+# whatever core.autocrlf says (Git for Windows defaults to CRLF).
+*.sh     text eol=lf
+*.py     text eol=lf
+*.test   text eol=lf
+*.cmake  text eol=lf
+Makefile text eol=lf
