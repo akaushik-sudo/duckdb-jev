@@ -173,6 +173,16 @@ the constraint, not parallelism. At 25 prompts a request and ~113 tokens a promp
 
 ## P4 — Distribution
 
+**0.2.0 (2026-09-30):** built locally with `scripts/build-release.sh 0.2.0` (Docker; linux_arm64 under
+QEMU), each binary tested against the mock and loaded into a stock duckdb 1.5.4 to check platform,
+stamped version and that only `snx_prompt_intent` / `snx_jev_last_query_stats` / `jev_version` exist.
+Handed to the first users directly, with `docs/USING.md`. **Not published to MinIO yet:** there are no
+upload credentials on the build machine (no AWS_* keys, no kubectl context). Ask the platform owner for
+a key scoped to `analytics-maven/ai/sentrinox/snx-jev/`, then add `scripts/publish.sh` (modelled on
+analytics-schema's `tools/publish-migrator.sh`; anonymous reads of that bucket already work). P5's
+image build needs the published URL.
+
+
 - Release binaries for **linux_amd64 and linux_arm64 only** (decided 2026-09-30): search runs in a
   Docker image (amd64 by default, arm64 via the Apple Silicon jib profile), so every Docker-based use is
   covered. osx_arm64 / windows_amd64 (native laptop use of the generic functions) are deferred until

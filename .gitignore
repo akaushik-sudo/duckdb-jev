@@ -10,3 +10,6 @@ test/python/__pycache__/
 # clangd/compile database written by the build
 .cache
 compile_commands.json
+
+# release builds (scripts/build-release.sh)
+dist/

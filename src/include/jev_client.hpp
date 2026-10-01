@@ -6,7 +6,7 @@
 namespace duckdb {
 
 //! Extension version, reported by jev_version() and sent as the User-Agent.
-#define JEV_VERSION "0.1.0"
+#define JEV_VERSION "0.2.0"
 
 //! One question, asked of every row in a batch.
 struct JevQuestion {
