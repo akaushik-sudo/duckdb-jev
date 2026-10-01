@@ -9,8 +9,10 @@
 # first time, ccache makes rebuilds quick), runs the mock suite against the build, loads the
 # binary into a stock duckdb 1.5.4 to check its platform and stamped version, and writes
 #
-#     dist/<version>/snx_jev-<version>-duckdb-<duckdb>-<platform>.duckdb_extension
-#     dist/<version>/snx_jev-<version>-duckdb-<duckdb>-<platform>.duckdb_extension.sha256
+#     dist/<version>/<platform>/snx_jev.duckdb_extension
+#
+# then runs scripts/package-release.sh, which checks each file again exactly as shipped and writes
+# the zips to hand out: dist/<version>/snx_jev-<version>-duckdb-<duckdb>-<platform>.zip
 #
 # Needs: git, Docker (Docker Desktop on Windows/macOS, which ships QEMU for arm64).
 # Overridable: SNX_JEV_REV (default HEAD), SNX_JEV_JOBS (parallel compile jobs, default 5).
@@ -71,5 +73,6 @@ for platform in "${PLATFORMS[@]}"; do
 done
 rm -f "$dist"/src*.tar
 
+SNX_JEV_REV="$REV" ./scripts/package-release.sh "$VERSION" "${PLATFORMS[@]}"
 say "done"
-( cd "$dist" && ls -l *.duckdb_extension && cat *.sha256 )
+ls -l "$dist"/*.zip

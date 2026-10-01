@@ -12,15 +12,19 @@ snx_prompt_intent(user_prompt VARCHAR)
 
 ## What you need
 
-- **The file for your machine.** Each file only loads into **DuckDB 1.5.4**, on Linux:
+- **The zip for your machine.** Each one holds `snx_jev.duckdb_extension`, which only loads into
+  **DuckDB 1.5.4**, on Linux:
 
-  | File | Runs on |
+  | Zip | Runs on |
   |---|---|
-  | `snx_jev-0.2.0-duckdb-v1.5.4-linux_amd64.duckdb_extension` | Linux on Intel/AMD, and Docker on an Intel/AMD Windows or Mac |
-  | `snx_jev-0.2.0-duckdb-v1.5.4-linux_arm64.duckdb_extension` | Linux on ARM, and Docker on an Apple Silicon Mac |
+  | `snx_jev-0.2.0-duckdb-v1.5.4-linux_amd64.zip` | Linux on Intel/AMD, and Docker on any Windows or Mac |
+  | `snx_jev-0.2.0-duckdb-v1.5.4-linux_arm64.zip` | Linux on ARM, and Docker on an Apple Silicon Mac (faster there) |
 
   On Windows or macOS, run DuckDB inside Docker or WSL (below): there are no native Windows or
   macOS builds yet. Check the file against its `.sha256` before you use it.
+- **Keep the file name `snx_jev.duckdb_extension`.** DuckDB works out the extension's entry point
+  from the file name, so a renamed file fails with "did not contain the expected entrypoint
+  function". Keep different versions in different folders instead.
 - **A TypeSafe API key** in the environment variable `TYPESAFE_API_KEY`. It is read once, when the
   extension loads, and there is no way to set it from SQL.
 - **Unsigned extensions allowed.** The extension is built by us, not signed by DuckDB:
@@ -31,12 +35,12 @@ snx_prompt_intent(user_prompt VARCHAR)
 On Linux, with the [DuckDB 1.5.4 CLI](https://github.com/duckdb/duckdb/releases/tag/v1.5.4):
 
 ```sh
-sha256sum -c snx_jev-0.2.0-duckdb-v1.5.4-linux_amd64.duckdb_extension.sha256
+sha256sum -c snx_jev.duckdb_extension.sha256
 TYPESAFE_API_KEY=... duckdb -unsigned
 ```
 
 ```sql
-LOAD './snx_jev-0.2.0-duckdb-v1.5.4-linux_amd64.duckdb_extension';
+LOAD './snx_jev.duckdb_extension';
 
 SELECT snx_prompt_intent('Write a SQL query that returns the top 10 models by cost last week.');
 
@@ -44,7 +48,7 @@ SELECT snx_prompt_intent('Write a SQL query that returns the top 10 models by co
 SELECT snx_jev_last_query_stats();
 ```
 
-In Docker, from the folder that holds the file (works on Windows, macOS and Linux). Set
+In Docker, from the folder you unzipped (works on Windows, macOS and Linux). Set
 `TYPESAFE_API_KEY` in your shell first; `-e TYPESAFE_API_KEY` passes it in without writing it on
 the command line:
 
@@ -58,12 +62,12 @@ python
 ```python
 import duckdb
 con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-con.execute("LOAD '/ext/snx_jev-0.2.0-duckdb-v1.5.4-linux_amd64.duckdb_extension'")
+con.execute("LOAD '/ext/snx_jev.duckdb_extension'")
 print(con.sql("SELECT snx_prompt_intent('plan a weekend trip to Lisbon') AS r"))
 print(con.sql("SELECT snx_jev_last_query_stats()"))
 ```
 
-On an Apple Silicon Mac, use the `linux_arm64` file. Or, if you only have the `linux_amd64` one,
+On an Apple Silicon Mac, use the `linux_arm64` zip. Or, if you only have the `linux_amd64` one,
 add `--platform linux/amd64` to `docker run`: Docker runs the container emulated, which is slower
 but makes little difference here, where the time goes to waiting on the API. Neither file loads into
 a native (non-Docker) macOS or Windows DuckDB.
@@ -107,6 +111,7 @@ See the [README](../README.md). Do not load community `jev` in the same process:
 | Error | Meaning |
 |---|---|
 | `... built for DuckDB version ...` / `... platform ...` | Wrong DuckDB version (must be 1.5.4) or wrong file for your CPU |
+| `did not contain the expected entrypoint function` | The file was renamed: it must be called `snx_jev.duckdb_extension` |
 | `extension ... is not signed` / unsigned | Start DuckDB with `-unsigned` (or `allow_unsigned_extensions`) |
 | `snx_jev: no API key` | `TYPESAFE_API_KEY` was not set when DuckDB started |
 | `API error 401` | The key is wrong |

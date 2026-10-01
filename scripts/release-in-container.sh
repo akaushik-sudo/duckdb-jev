@@ -24,27 +24,11 @@ for f in test/sql/*.test; do
   ./scripts/run_tests_with_mock.sh "$f"
 done
 
-binary=build/release/extension/snx_jev/snx_jev.duckdb_extension
+# The shipped file keeps the name snx_jev.duckdb_extension (DuckDB derives the entry point from
+# it); the version is in the folder and zip names. Checked as shipped, in a stock duckdb.
+mkdir -p "/dist/$PLATFORM"
+cp build/release/extension/snx_jev/snx_jev.duckdb_extension "/dist/$PLATFORM/snx_jev.duckdb_extension"
 python3 -m venv /tmp/venv
 /tmp/venv/bin/pip -q install "duckdb==${DUCKDB_VERSION#v}"
-/tmp/venv/bin/python - "$binary" <<'PY'
-import os, sys, duckdb
-binary = sys.argv[1]
-con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
-con.execute(f"LOAD '{binary}'")
-platform = con.execute("PRAGMA platform").fetchone()[0]
-row = con.execute("SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'snx_jev'").fetchone()
-version = con.execute("SELECT jev_version()").fetchone()[0]
-functions = sorted(r[0] for r in con.execute(
-    "SELECT DISTINCT function_name FROM duckdb_functions() WHERE function_name LIKE 'snx_%' OR function_name LIKE 'jev%'").fetchall())
-print(f"loaded into duckdb {duckdb.__version__} on {platform}: extension_version={row[0]} jev_version()={version} functions={functions}")
-assert platform == os.environ["PLATFORM"], platform
-assert row[0] == "v" + os.environ["VERSION"], row
-assert version == os.environ["VERSION"], version
-assert functions == ["jev_version", "snx_jev_last_query_stats", "snx_prompt_intent"], functions
-PY
-
-name="snx_jev-${VERSION}-duckdb-${DUCKDB_VERSION}-${PLATFORM}.duckdb_extension"
-cp "$binary" "/dist/$name"
-( cd /dist && sha256sum "$name" >"$name.sha256" )
-echo "== wrote /dist/$name"
+/tmp/venv/bin/python scripts/verify-release.py "/dist/$PLATFORM/snx_jev.duckdb_extension" "$VERSION" "$PLATFORM"
+echo "== wrote /dist/$PLATFORM/snx_jev.duckdb_extension"
