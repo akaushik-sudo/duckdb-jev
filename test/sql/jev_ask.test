@@ -249,6 +249,44 @@ SELECT jev_ask({'name': 'Ada'}, '{"q": {"type": "noul"}}');
 ----
 needs a non-empty string "question"
 
+# names are pasted into what the model reads, so they are plain identifiers
+statement error
+SELECT jev_ask({'name': 'Ada'}, '{"risk.level": {"type": "noul", "question": "?"}}');
+----
+must be 1-64 letters, digits or underscores
+
+statement error
+SELECT jev_ask({'name': 'Ada'}, '{"risk level": {"type": "noul", "question": "?"}}');
+----
+must be 1-64 letters, digits or underscores
+
+# the type is case-insensitive, as jev_eval's kind is
+query I
+SELECT jev_ask({'name': 'Ada'}, '{"team": {"type": "Choice", "question": "which team?", "options": ["a", "b"]}}')->'team'->>'choice' IN ('a', 'b');
+----
+true
+
+# options as a string or a prepared-statement parameter are a list of labels, as before MAP options
+query I
+SELECT jev_choice({'name': 'Ada'}, 'which team?', '[billing, technical]') IN ('billing', 'technical');
+----
+true
+
+statement ok
+PREPARE pick AS SELECT jev_choice({'name': 'Ada'}, 'which team?', ?) AS team;
+
+# the mock picks option len(row JSON) % 2 = 15 % 2 = 1
+query I
+EXECUTE pick(['billing', 'sales']);
+----
+sales
+
+# a text column is not a list of labels: refused at bind, not row by row
+statement error
+SELECT jev_choice({'name': 'Ada'}, 'which team?', c) FROM (VALUES ('billing,sales')) t(c);
+----
+the options are a list of labels or a MAP
+
 #
 # Batches close by estimated tokens, not only by row count
 #
@@ -284,6 +322,38 @@ INSERT INTO counters SELECT 1, jev_stats();
 
 query I
 SELECT delta('requests', 0, 1);
+----
+3
+
+statement ok
+RESET snx_jev_max_batch_tokens;
+
+# the estimate counts non-ASCII text per character, not per byte: at a 1500-token budget,
+# three 600-character ASCII rows (~200 tokens each) share a request, and three 600-character
+# CJK rows (~1200 tokens each) go one to a request
+statement ok
+SET snx_jev_max_batch_tokens = 1500;
+
+statement ok
+SELECT jev_cache_clear();
+
+query I
+SELECT DISTINCT (jev_eval(repeat(c, 600), 'the text is long')->>'mock_batch_rows')::INTEGER
+FROM (VALUES ('a'), ('b'), ('c')) t(c);
+----
+3
+
+query I
+SELECT DISTINCT (jev_eval(repeat(c, 600), 'the text is long')->>'mock_batch_rows')::INTEGER
+FROM (VALUES ('漢'), ('字'), ('語')) t(c);
+----
+1
+
+# 2-byte scripts count about a token a character, not two: three 300-character Cyrillic rows
+# (~300 tokens each) share a request (at 2 a character they would not all fit)
+query I
+SELECT DISTINCT (jev_eval(repeat(c, 300), 'the text is long')->>'mock_batch_rows')::INTEGER
+FROM (VALUES ('д'), ('ж'), ('ы')) t(c);
 ----
 3
 

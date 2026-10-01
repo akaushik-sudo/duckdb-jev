@@ -39,6 +39,11 @@ SELECT current_setting('snx_jev_batch_size');
 statement ok
 RESET snx_jev_batch_size;
 
+query I
+SELECT current_setting('snx_jev_max_wait_seconds');
+----
+600
+
 # The endpoint and the key are not settings: SQL can neither point requests elsewhere
 # nor read the key back.
 statement error
@@ -58,6 +63,11 @@ unrecognized configuration parameter
 
 statement error
 SELECT current_setting('jev_api_key');
+----
+unrecognized configuration parameter
+
+statement error
+SET snx_jev_max_requests_per_minute = 0;
 ----
 unrecognized configuration parameter
 

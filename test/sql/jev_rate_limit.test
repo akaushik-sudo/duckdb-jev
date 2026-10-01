@@ -1,0 +1,27 @@
+# name: test/sql/jev_rate_limit.test
+# description: the process-wide rate limit, from SNX_JEV_MAX_REQUESTS_PER_MINUTE
+# group: [sql]
+
+#
+# Run by scripts/run_tests_with_mock.sh with SNX_JEV_MAX_REQUESTS_PER_MINUTE=60: a bucket of 3,
+# refilled at 1 a second.
+
+require snx_jev
+
+require json
+
+require-env JEV_ASSERT_RATE_60
+
+require-env SNX_JEV_API_URL
+
+statement ok
+SET snx_jev_batch_size = 1;
+
+# 6 requests cannot all go at once: the last three wait about 1, 2 and 3 s
+statement ok
+SELECT snx_prompt_intent('rate limited prompt ' || i) FROM range(6) t(i);
+
+query II
+SELECT snx_jev_last_query_stats()->>'requests', (snx_jev_last_query_stats()->>'rate_limited_ms')::BIGINT >= 1000;
+----
+6	true

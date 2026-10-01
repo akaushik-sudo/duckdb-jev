@@ -28,6 +28,13 @@ struct JevEnvironment {
 	//! Off by default, so a process that serves generated SQL (search) has only
 	//! snx_prompt_intent. SQL cannot turn it on: it is read once, from the environment.
 	bool enable_generic = false;
+	//! SNX_JEV_MAX_REQUESTS_PER_MINUTE (default 1000, below Jev's 1,200; 0 = no limit): the
+	//! process-wide ceiling the rate limiter enforces. From the environment, like the endpoint,
+	//! because the bucket is shared: a per-connection setting would let one connection raise
+	//! or switch off the ceiling for every other.
+	idx_t max_requests_per_minute = 1000;
+	//! Why SNX_JEV_MAX_REQUESTS_PER_MINUTE was not usable; empty when it was fine or unset.
+	string rate_refusal;
 
 	//! Resolved once, on first use (the extension calls it at load).
 	static const JevEnvironment &Get();
@@ -55,8 +62,8 @@ struct JevConfig {
 	//! A batch closes before its estimated input tokens pass this, even under batch_size.
 	//! Jev allows 32k tokens of state (plus the longest question) and 64k per request.
 	idx_t max_batch_tokens = 24000;
-	//! Process-wide ceiling on requests a minute, below Jev's 1,200 (0 = no limit).
-	idx_t max_requests_per_minute = 1000;
+	//! How long a query waits for another query that is sending the same row (1..86400 s).
+	idx_t max_wait_seconds = 600;
 
 	//! Registers the settings on the database config. Called once, when the extension loads.
 	static void RegisterSettings(DBConfig &config);

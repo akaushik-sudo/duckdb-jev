@@ -1,0 +1,14 @@
+# name: test/sql/jev_rate_invalid.test
+# description: an unusable SNX_JEV_MAX_REQUESTS_PER_MINUTE refuses requests rather than guess a rate
+# group: [sql]
+
+require snx_jev
+
+require-env JEV_ASSERT_RATE_INVALID
+
+require-env SNX_JEV_API_URL
+
+statement error
+SELECT snx_prompt_intent('any prompt');
+----
+SNX_JEV_MAX_REQUESTS_PER_MINUTE must be a whole number

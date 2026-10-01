@@ -4,7 +4,7 @@
 
 #
 # Against the mock, with SNX_JEV_ENABLE_GENERIC=1 (for jev_stats). A row containing "slowmock"
-# makes the mock take 1.5 s, so the concurrent queries overlap.
+# makes the mock take 3 s, so the concurrent queries overlap.
 
 require snx_jev
 
@@ -47,3 +47,62 @@ SELECT MAX(CASE WHEN phase = 1 THEN (stats->>'shared_in_flight')::BIGINT END) -
 FROM counters;
 ----
 true
+
+#
+# A query whose own batch fails does not take the others down with it: a query that was
+# waiting on its row claims the row and sends it itself.
+#
+# Iteration 0 claims the shared row and sends it in a batch with a "fail422" row, which the
+# mock fails after 3 s. Iteration 1 asks only for the shared row, but first spends a fraction
+# of a second hashing 100M numbers, so it reaches the row while 0's request is in flight: it
+# waits, sees 0 fail, claims the row and sends it itself.
+
+statement ok
+SELECT jev_cache_clear();
+
+statement ok
+DELETE FROM counters;
+
+statement ok
+INSERT INTO counters SELECT 0, jev_stats();
+
+concurrentloop i 0 2
+
+statement maybe
+SELECT jev_prob(x, 'the text is shared')
+FROM (VALUES ('slowmock shared row'), (CASE WHEN ${i} = 0 THEN 'fail422 row' END)) t(x),
+     (SELECT sum(hash(r)) AS s FROM range(CASE WHEN ${i} = 1 THEN 100000000 ELSE 1 END) t(r)) d
+WHERE d.s IS NOT NULL;
+----
+API error 422
+
+endloop
+
+statement ok
+INSERT INTO counters SELECT 1, jev_stats();
+
+# the waiter really took the re-claim path, once, and its request is the only one that succeeded
+query II
+SELECT MAX(CASE WHEN phase = 1 THEN (stats->>'reclaimed')::BIGINT END) -
+       MAX(CASE WHEN phase = 0 THEN (stats->>'reclaimed')::BIGINT END),
+       MAX(CASE WHEN phase = 1 THEN (stats->>'requests')::BIGINT END) -
+       MAX(CASE WHEN phase = 0 THEN (stats->>'requests')::BIGINT END)
+FROM counters;
+----
+1	1
+
+# and its answer is cached: asking again sends nothing
+query I
+SELECT jev_prob(x, 'the text is shared') FROM (VALUES ('slowmock shared row')) t(x);
+----
+0.9
+
+statement ok
+INSERT INTO counters SELECT 2, jev_stats();
+
+query I
+SELECT MAX(CASE WHEN phase = 2 THEN (stats->>'requests')::BIGINT END) -
+       MAX(CASE WHEN phase = 1 THEN (stats->>'requests')::BIGINT END)
+FROM counters;
+----
+0

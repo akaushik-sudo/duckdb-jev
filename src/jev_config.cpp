@@ -115,6 +115,17 @@ static JevEnvironment ResolveEnvironment() {
 	environment.api_key = key ? string(key) : string();
 	auto generic = std::getenv("SNX_JEV_ENABLE_GENERIC");
 	environment.enable_generic = generic && string(generic) == "1";
+	auto rate = std::getenv("SNX_JEV_MAX_REQUESTS_PER_MINUTE");
+	if (rate && *rate) {
+		string text(rate);
+		if (text.size() > 7 || text.find_first_not_of("0123456789") != string::npos) {
+			// Refused like a bad endpoint, rather than silently running at some other rate.
+			environment.rate_refusal = "snx_jev: SNX_JEV_MAX_REQUESTS_PER_MINUTE must be a whole number of requests "
+			                           "a minute, 0 to 9999999 (0 = no limit)";
+		} else {
+			environment.max_requests_per_minute = std::stoull(text);
+		}
+	}
 
 	auto from_env = std::getenv("SNX_JEV_API_URL");
 	string requested = from_env ? string(from_env) : string();
@@ -173,9 +184,9 @@ void JevConfig::RegisterSettings(DBConfig &config) {
 	    LogicalType::UBIGINT, Value::UBIGINT(200000));
 	add("snx_jev_max_value_chars", "Characters of each string in a row that are sent; the rest is cut. 0 = no limit",
 	    LogicalType::UBIGINT, Value::UBIGINT(2000));
-	add("snx_jev_max_requests_per_minute",
-	    "Requests a minute across the whole process, below Jev's 1,200; requests over it wait. 0 = no limit",
-	    LogicalType::UBIGINT, Value::UBIGINT(1000));
+	add("snx_jev_max_wait_seconds",
+	    "Seconds a query waits for another query that is already sending the same row (1-86400)", LogicalType::UBIGINT,
+	    Value::UBIGINT(600));
 	add("snx_jev_max_batch_tokens",
 	    "Estimated input tokens at which a batch closes, even below snx_jev_batch_size (Jev allows 32k of state)",
 	    LogicalType::UBIGINT, Value::UBIGINT(24000));
@@ -224,8 +235,8 @@ JevConfig JevConfig::FromContext(ClientContext &context) {
 	if (TryGet(context, "snx_jev_max_value_chars", value)) {
 		config.max_value_chars = value.GetValue<uint64_t>();
 	}
-	if (TryGet(context, "snx_jev_max_requests_per_minute", value)) {
-		config.max_requests_per_minute = value.GetValue<uint64_t>();
+	if (TryGet(context, "snx_jev_max_wait_seconds", value)) {
+		config.max_wait_seconds = MinValue<idx_t>(86400, MaxValue<idx_t>(1, value.GetValue<uint64_t>()));
 	}
 	if (TryGet(context, "snx_jev_max_batch_tokens", value)) {
 		config.max_batch_tokens = MaxValue<idx_t>(1, value.GetValue<uint64_t>());
@@ -245,6 +256,9 @@ void JevConfig::RequireSendable() const {
 	auto &environment = JevEnvironment::Get();
 	if (environment.origin.empty()) {
 		throw InvalidInputException(environment.refusal);
+	}
+	if (!environment.rate_refusal.empty()) {
+		throw InvalidInputException(environment.rate_refusal);
 	}
 	if (api_key.empty()) {
 		throw InvalidInputException("snx_jev: no API key. Start DuckDB with TYPESAFE_API_KEY set in the environment.");

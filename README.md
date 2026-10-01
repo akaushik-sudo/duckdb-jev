@@ -69,8 +69,9 @@ a query moves between the two by changing `jev.batch_size` into `snx_jev_batch_s
    (2000) characters first, so no batch outgrows the context window.
 4. `snx_jev_concurrency` (16) requests are in flight at once, over connections that are kept alive. The
    ceiling is process-wide, so it still holds when DuckDB runs the scan on several threads. A
-   process-wide token bucket, `snx_jev_max_requests_per_minute` (1000, below Jev's 1,200), paces them,
-   so a large query slows down instead of meeting 429s.
+   process-wide token bucket, `SNX_JEV_MAX_REQUESTS_PER_MINUTE` in the environment at LOAD (1000, below
+   Jev's 1,200; `0` = none), paces them, so a large query slows down instead of meeting 429s. It is not
+   a setting: the bucket is shared, and one connection must not be able to raise it for all.
    Two queries (or two scan threads) that meet the same uncached row at once send it once: one sends,
    the other waits for that answer.
 5. Answers are cached by row content for as long as the process lives, so re-running a query, changing
@@ -162,7 +163,7 @@ is always there.
 | `jev_prob(row, condition)` | `DOUBLE` | Probability 0..1 that the row satisfies the condition |
 | `jev_score(row, question, levels)` | `DOUBLE` | Probability-weighted position on ordered levels (0 .. n-1) |
 | `jev_score_norm(row, question, levels)` | `DOUBLE` | The same, normalised to 0..1 |
-| `jev_choice(row, question, options)` | `VARCHAR` | The most likely option, returned verbatim. `options` is a list of labels, or a `MAP` of label → description |
+| `jev_choice(row, question, options)` | `VARCHAR` | The most likely option, returned verbatim. `options` is a list of labels, or a `MAP` of label → description. A prepared-statement `?` takes a list only |
 | `jev_confidence(row, question, kind, options)` | `DOUBLE` | Confidence of a `score` / `choice` answer |
 | `jev_eval(row, question [, kind [, options]])` | `JSON` | The full answer: probabilities, legend, confidence |
 | `jev_ask(row, questions)` | `JSON` | Several named questions about the row, answered in **one** request: `{"<name>": <answer>, ...}` |
@@ -231,7 +232,6 @@ silently different question. The answers come back in the order the questions we
 | `snx_jev_threshold` | `0.5` | Probability at which `jev()` returns true |
 | `snx_jev_batch_size` | `25` | Rows per request. Accuracy drops measurably above ~20-25 |
 | `snx_jev_concurrency` | `16` | Requests in flight at once, process-wide |
-| `snx_jev_max_requests_per_minute` | `1000` | Process-wide pace (token bucket, burst of 1/20 of it); `0` = none |
 | `snx_jev_timeout` | `30` | Seconds a single request may take |
 | `snx_jev_max_retries` | `6` | Attempts for a retryable failure (429, 5xx, a dropped connection) |
 | `snx_jev_max_rows_per_statement` | `0` (off) | Refuse a statement that would send more rows than this |
@@ -239,6 +239,7 @@ silently different question. The answers come back in the order the questions we
 | `snx_jev_cache_max_entries` | `200000` | Answers kept before the oldest are dropped |
 | `snx_jev_max_value_chars` | `2000` | Characters of each string in a row that are sent (code points; `0` = all) |
 | `snx_jev_max_batch_tokens` | `24000` | Estimated input tokens at which a batch closes, even below `snx_jev_batch_size` |
+| `snx_jev_max_wait_seconds` | `600` | How long a query waits for another query already sending the same row (1-86400) |
 
 Settings are read once per statement, so a `SET` applies to the next query and never changes mid-scan.
 The key and the endpoint are not settings; see above.

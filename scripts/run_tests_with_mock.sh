@@ -24,6 +24,7 @@ python3 test/mock_api.py "$PORT" &
 mock_pid=$!
 trap 'kill ${mock_pid} 2>/dev/null || true' EXIT
 
+mock_up=false
 for _ in $(seq 1 50); do
   if ! kill -0 "${mock_pid}" 2>/dev/null; then
     # Almost always "address already in use": something else owns the port, and
@@ -32,10 +33,15 @@ for _ in $(seq 1 50); do
     exit 1
   fi
   if python3 -c "import socket,sys; socket.create_connection(('127.0.0.1', ${PORT}), 0.2).close()" 2>/dev/null; then
+    mock_up=true
     break
   fi
   sleep 0.1
 done
+if ! $mock_up; then
+  echo "the mock API did not accept connections on port ${PORT} within 5 s" >&2
+  exit 1
+fi
 
 mock_url="http://127.0.0.1:${PORT}/v1/systemone"
 
@@ -53,6 +59,8 @@ case_ test/sql/jev_api.test SNX_JEV_ENABLE_GENERIC=1 JEV_MOCK_API_URL="$mock_url
 case_ test/sql/jev_ask.test SNX_JEV_ENABLE_GENERIC=1 JEV_MOCK_API_URL="$mock_url" SNX_JEV_API_URL="$mock_url" TYPESAFE_API_KEY="$MOCK_KEY"
 # The environment search runs in: no SNX_JEV_ENABLE_GENERIC, only snx_prompt_intent
 case_ test/sql/jev_prompt_intent.test JEV_ASSERT_PROMPT_INTENT_ONLY=1 SNX_JEV_API_URL="$mock_url" TYPESAFE_API_KEY="$MOCK_KEY"
+case_ test/sql/jev_rate_limit.test JEV_ASSERT_RATE_60=1 SNX_JEV_MAX_REQUESTS_PER_MINUTE=60 SNX_JEV_API_URL="$mock_url" TYPESAFE_API_KEY="$MOCK_KEY"
+case_ test/sql/jev_rate_invalid.test JEV_ASSERT_RATE_INVALID=1 SNX_JEV_MAX_REQUESTS_PER_MINUTE=fast SNX_JEV_API_URL="$mock_url" TYPESAFE_API_KEY="$MOCK_KEY"
 case_ test/sql/jev_concurrency.test SNX_JEV_ENABLE_GENERIC=1 JEV_MOCK_API_URL="$mock_url" SNX_JEV_API_URL="$mock_url" TYPESAFE_API_KEY="$MOCK_KEY"
 case_ test/sql/jev_wrong_key.test SNX_JEV_ENABLE_GENERIC=1 JEV_ASSERT_WRONG_KEY=1 SNX_JEV_API_URL="$mock_url" TYPESAFE_API_KEY=not-the-key
 
@@ -119,7 +127,7 @@ run() {
   env -u TYPESAFE_API_KEY -u SNX_JEV_API_URL \
       -u JEV_MOCK_API_URL -u JEV_ASSERT_NO_API_KEY -u JEV_ASSERT_WRONG_KEY \
       -u JEV_ASSERT_UNREACHABLE -u JEV_ASSERT_HOST_REFUSED -u JEV_ASSERT_PROMPT_INTENT_ONLY \
-      -u SNX_JEV_ENABLE_GENERIC \
+      -u SNX_JEV_ENABLE_GENERIC -u SNX_JEV_MAX_REQUESTS_PER_MINUTE -u JEV_ASSERT_RATE_60 -u JEV_ASSERT_RATE_INVALID \
       "$@" "$unittest" --test-dir . "$test_file"
 }
 

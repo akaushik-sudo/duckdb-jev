@@ -57,16 +57,19 @@ struct JevCallResult {
 //! (429, 5xx, dropped connections) and throws otherwise.
 JevCallResult JevCallAPI(const JevConfig &config, const JevQuestionSet &set, const vector<string> &rows_json);
 
-//! Size of a request for `set`, so batches can be closed before they outgrow the API's
-//! context window: the request with no rows, and what each row adds on top of its own JSON.
+//! Estimated input tokens of a request for `set`, so batches can be closed before they outgrow
+//! the API's context window: the request with no rows, and what each row adds on top of its
+//! own JSON.
 struct JevRequestSize {
-	idx_t fixed_bytes;
-	idx_t per_row_bytes;
+	idx_t fixed_tokens;
+	idx_t per_row_tokens;
 };
 JevRequestSize JevMeasureRequest(const JevConfig &config, const JevQuestionSet &set);
 
-//! Conservative token estimate for `bytes` of request JSON (English runs ~4 bytes a token;
-//! this assumes 3, so a batch closes early rather than late).
-idx_t JevEstimateTokens(idx_t bytes);
+//! Conservative token estimate for request text, by UTF-8 sequence length. ASCII runs ~4 bytes
+//! a token; this counts 3. A 2-byte character (accented Latin, Cyrillic, Greek, ...) counts 1,
+//! and a 3- or 4-byte one (CJK, emoji) counts 2: a byte count badly undercounts those, a flat
+//! per-character count badly overcounts the 2-byte scripts.
+idx_t JevEstimateTokens(const string &text);
 
 } // namespace duckdb
