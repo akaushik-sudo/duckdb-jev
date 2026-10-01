@@ -63,7 +63,10 @@ print(con.sql("SELECT snx_prompt_intent('plan a weekend trip to Lisbon') AS r"))
 print(con.sql("SELECT snx_jev_last_query_stats()"))
 ```
 
-On an Apple Silicon Mac, use the `linux_arm64` file.
+On an Apple Silicon Mac, use the `linux_arm64` file. Or, if you only have the `linux_amd64` one,
+add `--platform linux/amd64` to `docker run`: Docker runs the container emulated, which is slower
+but makes little difference here, where the time goes to waiting on the API. Neither file loads into
+a native (non-Docker) macOS or Windows DuckDB.
 
 ## Classifying real prompts
 
