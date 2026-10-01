@@ -1,9 +1,9 @@
 #
 # Every push to main and every PR: build on linux_amd64 and run the suite against the mock API.
-# A tag (or a manual run): build the release binaries for the platforms we load them on.
+# Release binaries are built locally (scripts/build-release.sh); the distribution job here runs
+# only when started by hand (workflow_dispatch), for linux_amd64 and linux_arm64.
 #
-# This repo is private, so Actions minutes are metered (macOS counts 10x). The full platform
-# matrix only runs when binaries are actually wanted.
+# This repo is private, so Actions minutes are metered: a tag does not start a platform build.
 #
 name: Main Extension Distribution Pipeline
 on:
@@ -22,7 +22,7 @@ jobs:
     name: Build extension binaries
     # Never build release binaries from a commit whose suite fails.
     needs: mock-api-tests
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch'
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.4
     with:
       # Must match the DuckDB the services load it into (analytics-schema pom.xml
@@ -30,9 +30,9 @@ jobs:
       duckdb_version: v1.5.4
       ci_tools_version: v1.5.4
       extension_name: snx_jev
-      # Built: linux_amd64, linux_arm64 (service images), osx_arm64, windows_amd64 (dev machines).
-      # WASM has neither HTTPS nor a thread pool, which snx_jev needs.
-      exclude_archs: 'osx_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+      # Built: linux_amd64 and linux_arm64 only (search runs in Docker images). WASM has neither
+      # HTTPS nor a thread pool, which snx_jev needs.
+      exclude_archs: 'osx_amd64;osx_arm64;windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
   code-quality-check:
     name: Code Quality Check
